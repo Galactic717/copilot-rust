@@ -2,61 +2,79 @@
 
 [![CI](https://github.com/Magerko/copilot/actions/workflows/ci.yml/badge.svg)](https://github.com/Magerko/copilot/actions/workflows/ci.yml)
 
-Слушает разговор, распознаёт речь локально, замечает вопросы и показывает короткий
-ответ в небольшом оверлее — с опорой на загруженные документы. Windows.
+Слухає розмову, розпізнає мовлення локально, помічає питання й показує коротку відповідь
+у невеликому оверлеї — з опорою на завантажені документи. Windows. Написано на Rust.
 
-## Возможности
-- Локальное распознавание речи (whisper.cpp): аудио не уходит в сеть и не пишется на диск.
-- Модель ответов на выбор: локальная (Ollama, LM Studio) или облачная по ключу
-  (OpenAI, Anthropic, Gemini, AnyModel, любой OpenAI-совместимый). Ключи — в DPAPI.
-- Ответы опираются только на загруженные документы; не найденное помечается `[нет в резюме]`.
-- Снимок выделенной области экрана → vision-модель или локальный OCR.
-- Оверлей не забирает фокус, автоподстройка высоты, регулируемая прозрачность.
-- Окна можно исключить из захвата экрана (флаг Windows SetWindowDisplayAffinity;
-  поддерживается не всеми программами захвата).
-- Сворачивание в трей, аварийная остановка, продолжение прошлой сессии.
-- Учёт расхода по платным моделям и лимиты в настройках. Офлайн-режим блокирует внешние вызовы.
-- Без аккаунта и своего сервера.
+[English below](#english)
 
-## Скриншоты
-![Главный экран](docs/screenshots/dashboard.png)
+## Можливості
+- Інтерфейс українською та англійською.
+- Локальне розпізнавання мовлення (whisper.cpp) з Silero VAD: аудіо не йде в мережу й не пишеться на диск.
+- Модель відповідей на вибір — один каталог для всіх сервісів:
+  локально через **llama.cpp** (застосунок сам запускає `llama-server` з GGUF-моделлю) або за вашим ключем:
+  OpenAI, Anthropic, Gemini, **OpenRouter**, Groq, DeepSeek, Mistral, xAI, Together, Fireworks, Cerebras, AnyModel
+  чи будь-який OpenAI-сумісний сервер. Усі ключі — в одному розділі «Ключі API», зашифровані DPAPI.
+- Відповіді спираються лише на завантажені документи (PDF/DOCX/TXT/MD); чого немає — позначається `[немає в резюме]`.
+- Знімок виділеної області екрана → vision-модель або вбудований OCR Windows.
+- Оверлей не забирає фокус, підлаштовує висоту, має регульовану прозорість фону.
+- Вікна можна виключити із захоплення екрана (прапорець Windows `WDA_EXCLUDEFROMCAPTURE`; підтримується не всіма програмами захоплення).
+- Трей, глобальні гарячі клавіші, аварійна зупинка, продовження минулої сесії, історія в SQLite з експортом у Markdown/JSON.
+- Облік витрат і ліміти. Офлайн-режим блокує зовнішні виклики.
+- Без акаунта й власного сервера.
 
-| Оверлей | Прозрачный фон |
+## Скриншоти
+![Головна](docs/screenshots/home.png)
+
+| Сесія | Оверлей |
 |---|---|
-| ![Оверлей](docs/screenshots/overlay-answer.png) | ![Прозрачный](docs/screenshots/overlay-transparent.png) |
+| ![Сесія](docs/screenshots/live.png) | ![Оверлей](docs/screenshots/overlay.png) |
 
-| Онбординг | Согласия |
+| Вибір моделі | Налаштування підказок |
 |---|---|
-| ![Онбординг](docs/screenshots/onboarding.png) | ![Согласия](docs/screenshots/consent.png) |
+| ![Модель](docs/screenshots/onboarding-model.png) | ![Підказки](docs/screenshots/settings-hints.png) |
 
-| Провайдеры | Приватность |
-|---|---|
-| ![Провайдеры](docs/screenshots/settings-providers.png) | ![Приватность](docs/screenshots/settings-privacy.png) |
+## Перший запуск
+1. Мова → звук (мікрофон і системний звук) → розпізнавання (завантаження ≈ 160 МБ, перевірка SHA-256).
+2. Модель: llama.cpp (шлях до `llama-server.exe` і `.gguf`) або сервіс із ключем.
+3. Профіль і документи.
 
-## Первый запуск
-1. Язык → звук (микрофон и системный звук) → распознавание (загрузка ≈ 160 МБ).
-2. Модель: [Ollama](https://ollama.com) подхватывается сама, иначе — провайдер и ключ.
-3. Профиль и документы (PDF/DOCX/TXT).
-
-## Горячие клавиши
+## Гарячі клавіші
 | | |
 |---|---|
-| Показать / скрыть подсказки | `Ctrl+Alt+H` |
-| Ответить сейчас | `Ctrl+Alt+Enter` |
-| Пауза / продолжить | `Ctrl+Alt+L` |
-| Снимок области экрана | `Ctrl+Alt+S` |
-| Подробнее | `Ctrl+Alt+E` |
-| Аварийная остановка | `Ctrl+Alt+Backspace` |
+| Показати / сховати підказки | `Ctrl+Alt+H` |
+| Відповісти зараз | `Ctrl+Alt+Enter` |
+| Пауза / продовжити | `Ctrl+Alt+L` |
+| Знімок області екрана | `Ctrl+Alt+S` |
+| Детальніше | `Ctrl+Alt+E` |
+| Аварійна зупинка | `Ctrl+Alt+Backspace` |
 
-## Для разработчиков
+## Для розробників
 ```powershell
-npm install
-npm test
-npm run dev       # разработка
-npm run dist      # установщик в release/
+cargo test
+cargo run                    # розробка
+cargo build --release        # target\release\Copilot.exe (+ DirectML.dll поруч)
 ```
-Архитектура и решения — в `docs/pipeline/`.
+- Дані: `%APPDATA%\copilot` (settings.json, providers.json, keys.dpapi.json, kairos.db, asr\). Інша тека — `COPILOT_DATA_DIR`.
+- `COPILOT_SNAPSHOT=<тека>` рендерить усі екрани у PNG без показу вікон і завершується.
+- Живий тест розпізнавання: `COPILOT_ASR_DIR=<тека> COPILOT_TEST_WAV=<16 кГц wav> cargo test live_whisper -- --ignored`.
 
-## Контакты
+---
+
+## English
+
+Listens to a conversation, recognizes speech locally, spots questions and shows a short answer in a small
+overlay, grounded in your documents. Windows. Written in Rust.
+
+- UI in Ukrainian and English.
+- Local speech recognition (whisper.cpp) gated by Silero VAD: audio never leaves the machine.
+- One catalog for every answer model: local **llama.cpp** (the app can start `llama-server` with a GGUF model) or
+  your own key for OpenAI, Anthropic, Gemini, **OpenRouter**, Groq, DeepSeek, Mistral, xAI, Together, Fireworks,
+  Cerebras, AnyModel or any OpenAI-compatible server. All keys live in one “API keys” section, encrypted with DPAPI.
+- Answers use only your documents; missing facts are marked `[not in CV]`.
+- Screen-region snapshot → vision model or the built-in Windows OCR.
+- Focus-less overlay, capture exclusion flag, tray, global hotkeys, emergency stop, session resume,
+  SQLite history with Markdown/JSON export, spend limits, offline mode. No account, no server.
+
+## Контакти / Contacts
 - Telegram: [@magerdev1](https://t.me/magerdev1)
 - GitHub: <https://github.com/Magerko/copilot>
