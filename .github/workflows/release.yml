@@ -1,6 +1,6 @@
 name: Release
 
-# Push a tag like v0.3.0 to build on a clean Windows runner and publish a GitHub Release.
+# Push a tag like v1.0.0 to build on a clean Windows runner and publish a GitHub Release.
 on:
   push:
     tags: ['v*']
@@ -17,29 +17,31 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --locked
       - run: cargo build --release --locked
-      - name: Package and publish
+        env:
+          COPILOT_RELEASE_BUILD: '1'
+      - run: python scripts/package.py
+      - name: Publish
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -e
           ver="${GITHUB_REF_NAME#v}"
-          dir="Copilot-${ver}-windows-x64"
-          mkdir "$dir"
-          cp target/release/Copilot.exe "$dir/"
-          cp target/release/*.dll "$dir/" 2>/dev/null || true
-          cp README.md LICENSE "$dir/"
-          7z a "${dir}.zip" "$dir" > /dev/null
-          sha=$(sha256sum "${dir}.zip" | awk '{print $1}')
-          notes="Локальний AI-копілот для інтерв'ю та зустрічей (Windows). Розпізнавання мовлення на вашому ПК, відповіді від вашої моделі (BYOK) або локально через llama.cpp.
+          full="Copilot-${ver}-windows-x64.exe"
+          lite="Copilot-${ver}-windows-x64-lite.exe"
+          cat > notes.md <<EOF
+          **Download \`${full}\` and run it.** One file with everything inside; nothing to install. Windows 10 2004 or newer.
 
-          **Встановлення:** розпакуйте \`${dir}.zip\` і запустіть \`Copilot.exe\`. Файл не підписаний сертифікатом — Windows SmartScreen може показати «Невідомий видавець»: «Докладніше» → «Однаково запустити».
+          \`${lite}\` is the app alone; it fetches its components when first needed.
 
-          **SHA-256** \`${dir}.zip\`:
-          \`${sha}\`"
+          The file is not code-signed yet, so SmartScreen shows a warning the first time: **More info → Run anyway**. Compare with \`SHA256SUMS.txt\` if you want to verify the download.
+
+          See [CHANGELOG.md](https://github.com/${GITHUB_REPOSITORY}/blob/main/CHANGELOG.md) for what changed.
+          EOF
+          sed -i 's/^          //' notes.md
           if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
-            gh release edit "$GITHUB_REF_NAME" --title "Copilot ${GITHUB_REF_NAME}" --notes "$notes"
-            gh release upload "$GITHUB_REF_NAME" "${dir}.zip" --clobber
+            gh release edit "$GITHUB_REF_NAME" --title "Copilot ${GITHUB_REF_NAME}" --notes-file notes.md
+            gh release upload "$GITHUB_REF_NAME" "dist/${full}" "dist/${lite}" dist/SHA256SUMS.txt THIRD-PARTY-NOTICES.md --clobber
           else
-            gh release create "$GITHUB_REF_NAME" --title "Copilot ${GITHUB_REF_NAME}" --notes "$notes" "${dir}.zip"
+            gh release create "$GITHUB_REF_NAME" --title "Copilot ${GITHUB_REF_NAME}" --notes-file notes.md "dist/${full}" "dist/${lite}" dist/SHA256SUMS.txt THIRD-PARTY-NOTICES.md
           fi
