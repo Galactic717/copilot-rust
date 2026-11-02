@@ -51,6 +51,9 @@ pub fn show(ui: &mut egui::Ui, c: &mut Ctx, st: &mut HistoryState) {
     text_input(ui, &mut st.query, t("Пошук за назвою і транскриптом", "Search by title and transcript"), ui.available_width());
     ui.add_space(6.0);
     let list = core.db.list_sessions(&st.query, 50);
+    if st.open.is_none() {
+        st.open = list.first().map(|x| x.id.clone());
+    }
     let h = (ui.clip_rect().height() - 150.0).max(480.0);
     ui.horizontal_top(|ui| {
         let left_w = 320.0;
@@ -113,6 +116,7 @@ pub fn show(ui: &mut egui::Ui, c: &mut Ctx, st: &mut HistoryState) {
                     });
                 });
                 egui::ScrollArea::vertical().id_salt("hist-detail").auto_shrink([false, false]).show(ui, |ui| {
+                    debrief(ui, &core, &id, &col(sess, "summary"), !d.segments.is_empty());
                     for q in crate::export::latest_questions(&d.questions) {
                         h3(ui, &col(q, "text"));
                         for a in d.answers.iter().filter(|a| col(a, "question_id") == col(q, "id") && col(a, "status") == "done") {
@@ -136,4 +140,31 @@ pub fn show(ui: &mut egui::Ui, c: &mut Ctx, st: &mut HistoryState) {
             });
         });
     });
+}
+
+/// The debrief of a saved session: the stored one, or the one being written right now.
+fn debrief(ui: &mut egui::Ui, core: &std::sync::Arc<crate::core::Core>, id: &str, stored: &str, has_transcript: bool) {
+    let running = core.debriefs.lock().unwrap().get(id).map(|s| s.lock().unwrap().clone());
+    let busy = running.as_ref().is_some_and(|g| g.busy);
+    let text = running.as_ref().filter(|g| !g.text.is_empty()).map_or(stored, |g| g.text.as_str());
+    card_fill(ui, p().surface2, |ui| {
+        ui.horizontal(|ui| {
+            h3(ui, t("Підсумок", "Debrief"));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let label = if busy { t("Пишу…", "Writing…") } else if text.is_empty() { t("Написати підсумок", "Write a debrief") } else { t("Переписати", "Rewrite") };
+                if button(ui, label, Kind::Normal, true, !busy && has_transcript).clicked() {
+                    core.debrief(id);
+                }
+            });
+        });
+        if text.is_empty() {
+            note(ui, if has_transcript { t("Коротко про розмову: що було, що вирішили, що підтягнути. Транскрипт іде до вибраної моделі.", "A short account of the conversation: what happened, what was decided, what to work on. The transcript goes to the selected model.") } else { t("Немає транскрипту, з якого писати.", "There is no transcript to write from.") });
+        } else {
+            markdown(ui, text, 13.5);
+        }
+        if let Some(e) = running.as_ref().and_then(|g| g.error.as_ref()) {
+            ui.label(small(e).color(p().err));
+        }
+    });
+    ui.add_space(8.0);
 }

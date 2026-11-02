@@ -3,9 +3,11 @@
 mod asr;
 mod audio;
 mod budget;
+mod bundle;
 mod context;
 mod core;
 mod db;
+mod discover;
 mod export;
 mod i18n;
 mod icon;
@@ -20,11 +22,11 @@ mod session;
 mod settings;
 mod types;
 mod ui;
+mod update;
 mod win;
 
 use std::path::PathBuf;
 
-/// Runtime data lives outside OneDrive/Cyrillic paths (whisper.cpp opens model files with ANSI APIs).
 /// The previous build's folder layout is kept, so settings, history and downloaded models carry over.
 fn data_dir() -> PathBuf {
     if let Some(dir) = std::env::var_os("COPILOT_DATA_DIR") {
@@ -45,9 +47,12 @@ fn data_dir() -> PathBuf {
 }
 
 fn main() {
-    if !win::single_instance() {
+    // A test instance (own data folder) runs next to the user's real one and must not touch it.
+    let isolated = std::env::var_os("COPILOT_DATA_DIR").is_some() || std::env::var_os("COPILOT_SNAPSHOT").is_some();
+    if !isolated && !win::single_instance(std::env::args().any(|a| a == update::RELAUNCH_ARG)) {
         return;
     }
+    update::clean_old();
     std::panic::set_hook(Box::new(|info| {
         db::diag("panic", serde_json::json!({ "message": redact::redact(&info.to_string()) }));
     }));

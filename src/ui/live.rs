@@ -12,6 +12,7 @@ use crate::types::*;
 pub struct LiveState {
     typed: String,
     editing: Option<String>,
+    mock_answer: String,
 }
 
 pub fn provenance(a: &AnswerEvent) -> String {
@@ -79,6 +80,9 @@ pub fn show(ui: &mut egui::Ui, c: &mut Ctx, st: &mut LiveState) {
                 if primary(ui, t("Тренування", "Practice"), true) {
                     core.start_session(SessionMode::Practice);
                 }
+                if btn(ui, t("Тренувальне інтерв'ю", "Mock interview")) {
+                    core.mock_next();
+                }
                 if btn(ui, t("Інтерв'ю / дзвінок", "Interview / call")) {
                     core.start_session(SessionMode::Live);
                 }
@@ -89,6 +93,10 @@ pub fn show(ui: &mut egui::Ui, c: &mut Ctx, st: &mut LiveState) {
         });
     });
     ui.add_space(10.0);
+    if snap.mode == Some(SessionMode::Mock) {
+        mock_panel(ui, c, st, q.is_some());
+        ui.add_space(10.0);
+    }
 
     let height = (ui.clip_rect().height() - 150.0).max(460.0);
     ui.columns(2, |cols| {
@@ -192,6 +200,9 @@ pub fn show(ui: &mut egui::Ui, c: &mut Ctx, st: &mut LiveState) {
                         }
                     } else {
                         ui.add(egui::Label::new(RichText::new(&q.text).font(super::theme::semibold(18.0))).wrap());
+                        if let Some(tr) = &snap.translation {
+                            ui.add(egui::Label::new(RichText::new(tr).color(p().muted)).wrap());
+                        }
                     }
                     ui.add_space(6.0);
                     let a = &snap.answers;
@@ -263,6 +274,41 @@ pub fn show(ui: &mut egui::Ui, c: &mut Ctx, st: &mut LiveState) {
             }
         });
     }
+}
+
+/// The app asks, the user answers aloud (or types), the app reviews the answer.
+fn mock_panel(ui: &mut egui::Ui, c: &mut Ctx, st: &mut LiveState, has_question: bool) {
+    let core = c.core.clone();
+    let question = core.mock.question.lock().unwrap().clone();
+    let feedback = core.mock.feedback.lock().unwrap().clone();
+    card(ui, |ui| {
+        h2(ui, t("Тренувальне інтерв'ю", "Mock interview"));
+        note(ui, t("Відповідайте вголос: мікрофон уже слухає. Потім натисніть «Оцінити». Питання будуються за вашим профілем, резюме й вакансією.", "Answer aloud: the microphone is listening. Then press “Review”. Questions come from your profile, CV and the job."));
+        ui.horizontal_wrapped(|ui| {
+            if button(ui, if question.busy { t("Готую питання…", "Preparing a question…") } else { t("Наступне питання", "Next question") }, Kind::Primary, false, !question.busy).clicked() {
+                st.mock_answer.clear();
+                core.mock_next();
+            }
+            if button(ui, if feedback.busy { t("Оцінюю…", "Reviewing…") } else { t("Оцінити мою відповідь", "Review my answer") }, Kind::Normal, false, has_question && !feedback.busy).clicked() {
+                core.mock_feedback(&st.mock_answer);
+            }
+            if button(ui, t("Показати приклад відповіді", "Show a sample answer"), Kind::Ghost, false, has_question).clicked() {
+                core.session.answer_now(AnswerKind::Say, QuestionTrigger::Manual);
+            }
+        });
+        if has_question {
+            let w = ui.available_width();
+            text_input(ui, &mut st.mock_answer, t("Або введіть відповідь текстом", "Or type your answer"), w);
+        }
+        error_text(ui, &question.error);
+        error_text(ui, &feedback.error);
+        if !feedback.text.is_empty() {
+            egui::Frame::new().fill(p().surface2).corner_radius(8).inner_margin(egui::Margin::same(12)).show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                markdown(ui, &feedback.text, 14.0);
+            });
+        }
+    });
 }
 
 fn kind_label(k: UtteranceKind) -> &'static str {

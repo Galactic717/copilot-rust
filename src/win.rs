@@ -241,10 +241,24 @@ pub fn open_url(url: &str) {
 }
 
 /// Returns false if another instance already runs; that instance's window is brought up.
-pub fn single_instance() -> bool {
+/// `wait` is for a relaunch after an update: the previous version is on its way out and gets a few seconds to go.
+pub fn single_instance(wait: bool) -> bool {
     unsafe {
-        let _ = CreateMutexW(None, true, &HSTRING::from("Local\\app.copilot.single-instance"));
-        if windows::Win32::Foundation::GetLastError() == windows::Win32::Foundation::ERROR_ALREADY_EXISTS {
+        let name = HSTRING::from("Local\\app.copilot.single-instance");
+        let mut h = CreateMutexW(None, true, &name);
+        let taken = || windows::Win32::Foundation::GetLastError() == windows::Win32::Foundation::ERROR_ALREADY_EXISTS;
+        let mut busy = taken();
+        let mut tries = if wait { 40 } else { 0 };
+        while busy && tries > 0 {
+            if let Ok(handle) = h {
+                let _ = windows::Win32::Foundation::CloseHandle(handle);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(250));
+            h = CreateMutexW(None, true, &name);
+            busy = taken();
+            tries -= 1;
+        }
+        if busy {
             if let Ok(h) = FindWindowW(PCWSTR::null(), &HSTRING::from(TITLE_MAIN)) {
                 let _ = ShowWindow(h, SW_SHOW);
                 let _ = ShowWindow(h, SW_RESTORE);
@@ -254,4 +268,87 @@ pub fn single_instance() -> bool {
         }
     }
     true
+}
+
+/// Physical memory in bytes; 0 when unknown (then every model "fits").
+pub fn total_ram() -> u64 {
+    use windows::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    let mut m = MEMORYSTATUSEX { dwLength: std::mem::size_of::<MEMORYSTATUSEX>() as u32, ..Default::default() };
+    unsafe { GlobalMemoryStatusEx(&mut m) }.map(|_| m.ullTotalPhys).unwrap_or(0)
+}
+
+/// "uk-UA", "en-US"…: the Windows display language, used once for a first run.
+pub fn system_locale() -> String {
+    use windows::Win32::Globalization::GetUserDefaultLocaleName;
+    let mut buf = [0u16; 85];
+    let n = unsafe { GetUserDefaultLocaleName(&mut buf) };
+    String::from_utf16_lossy(&buf[..(n.max(1) as usize - 1).min(buf.len())])
+}
+
+const RUN_KEY: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+const RUN_VALUE: &str = "Copilot";
+/// Started by Windows at login: stay in the tray until asked.
+pub const TRAY_ARG: &str = "--tray";
+
+pub fn autostart_enabled() -> bool {
+    use windows::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_SZ};
+    let mut len = 0u32;
+    unsafe { RegGetValueW(HKEY_CURRENT_USER, &HSTRING::from(RUN_KEY), &HSTRING::from(RUN_VALUE), RRF_RT_REG_SZ, None, None, Some(&mut len)) }.is_ok()
+}
+
+pub fn set_autostart(on: bool) -> Result<(), String> {
+    use windows::Win32::System::Registry::{RegCloseKey, RegCreateKeyW, RegDeleteValueW, RegSetValueExW, HKEY, HKEY_CURRENT_USER, REG_SZ};
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    unsafe {
+        let mut key = HKEY::default();
+        RegCreateKeyW(HKEY_CURRENT_USER, &HSTRING::from(RUN_KEY), &mut key).ok().map_err(|e| e.to_string())?;
+        let r = if on {
+            let cmd: Vec<u16> = format!("\"{}\" {TRAY_ARG}\0", exe.display()).encode_utf16().collect();
+            let bytes = std::slice::from_raw_parts(cmd.as_ptr() as *const u8, cmd.len() * 2);
+            RegSetValueExW(key, &HSTRING::from(RUN_VALUE), None, REG_SZ, Some(bytes)).ok()
+        } else {
+            let _ = RegDeleteValueW(key, &HSTRING::from(RUN_VALUE));
+            Ok(())
+        };
+        let _ = RegCloseKey(key);
+        r.map_err(|e| e.to_string())
+    }
+}
+
+fn start_menu_link() -> Option<std::path::PathBuf> {
+    Some(std::path::PathBuf::from(std::env::var_os("APPDATA")?).join("Microsoft").join("Windows").join("Start Menu").join("Programs").join("Copilot.lnk"))
+}
+
+pub fn start_menu_shortcut_exists() -> bool {
+    start_menu_link().is_some_and(|p| p.is_file())
+}
+
+/// COM needs its own apartment, so this runs on a throwaway thread rather than touching the UI thread's.
+pub fn create_start_menu_shortcut() -> Result<(), String> {
+    use windows::core::Interface;
+    use windows::Win32::System::Com::{CoCreateInstance, CoInitializeEx, CoUninitialize, IPersistFile, CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED};
+    use windows::Win32::UI::Shell::{IShellLinkW, ShellLink};
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let link = start_menu_link().ok_or_else(|| "APPDATA".to_string())?;
+    std::thread::spawn(move || unsafe {
+        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        let r = (|| -> windows::core::Result<()> {
+            let l: IShellLinkW = CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER)?;
+            l.SetPath(&HSTRING::from(exe.as_os_str()))?;
+            if let Some(d) = exe.parent() {
+                l.SetWorkingDirectory(&HSTRING::from(d.as_os_str()))?;
+            }
+            l.SetDescription(&HSTRING::from("Copilot"))?;
+            l.cast::<IPersistFile>()?.Save(&HSTRING::from(link.as_os_str()), true)
+        })();
+        CoUninitialize();
+        r.map_err(|e| e.to_string())
+    })
+    .join()
+    .map_err(|_| "shortcut thread panicked".to_string())?
+}
+
+/// Starts the given exe detached from this process, for the relaunch after an update.
+pub fn relaunch(exe: &std::path::Path) -> Result<(), String> {
+    std::process::Command::new(exe).arg(crate::update::RELAUNCH_ARG).spawn().map(|_| ()).map_err(|e| e.to_string())
 }

@@ -21,6 +21,8 @@ static HALLUCINATIONS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
     [
         r"(?i)^(thank you( so much)? for watching|thanks for watching|please subscribe|subtitles by)",
         r"(?i)^(дякую за перегляд|субтитри|підписуйтесь|редактор субтитрів)",
+        // Whisper learned these from subtitle credits; "amara.org" turns up in most languages.
+        r"(?i)amara\.org|^(untertitel|sous-titres?|subtítulos|sottotitoli|legendas|napisy|altyazı|字幕|ご視聴ありがとう|시청해 주셔서)",
         r"^[.\s…♪]*$",
     ]
     .iter()
@@ -128,9 +130,14 @@ impl WhisperSidecar {
     pub async fn start(server: PathBuf, model: PathBuf, threads: u32, net: Arc<Net>) -> Result<Self, String> {
         let port = crate::proc::free_port().map_err(|e| e.to_string())?;
         let mut cmd = Command::new(&server);
-        cmd.arg("-m").arg(&model).args(["--host", "127.0.0.1", "--port", &port.to_string(), "-t", &threads.to_string()]);
-        if let Some(d) = server.parent() {
+        // whisper.cpp opens its model through ANSI APIs, which cannot reach a profile named in Cyrillic. Starting it in the
+        // model's folder and passing a bare file name always works; its DLLs load from the exe's folder regardless.
+        cmd.arg("-m").arg(model.file_name().unwrap_or_default()).args(["--host", "127.0.0.1", "--port", &port.to_string(), "-t", &threads.to_string()]);
+        if let Some(d) = model.parent() {
             cmd.current_dir(d);
+        }
+        if let Some(d) = server.parent() {
+            crate::proc::ensure_vc_runtime(d);
         }
         cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped());
         let mut child = crate::proc::spawn_hidden(&mut cmd).map_err(|e| e.to_string())?;
@@ -255,7 +262,7 @@ mod tests {
         }
         let wav = std::fs::read(std::env::var("COPILOT_TEST_WAV").expect("COPILOT_TEST_WAV")).unwrap();
         let pcm: Vec<i16> = wav[44..].as_chunks::<2>().0.iter().map(|b| i16::from_le_bytes(*b)).collect();
-        let speech = crate::asr::silero::SileroGate::default().speech_seconds(&pcm, 0.5).unwrap();
+        let speech = crate::asr::silero::speech_seconds(&pcm, 0.5);
         assert!(speech > 1.0, "silero heard {speech} s of speech");
         let sc = WhisperSidecar::start(assets.server_path(AsrBackend::Cpu).unwrap(), assets.model_path("base"), 4, net.clone()).await.expect("whisper-server starts");
         let (net, port) = sc.endpoint();

@@ -1,5 +1,5 @@
-//! llama.cpp support beyond "point at a running server": the app can start `llama-server` itself with a GGUF model,
-//! wait until the model is loaded (`/health` → 200) and stop it on exit.
+//! Local servers the app runs itself: `llama-server` with a GGUF model, or an installed but stopped `ollama serve`.
+//! It waits until the model is loaded (`/health` or the model list → 200) and stops the process on exit.
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader};
@@ -109,19 +109,29 @@ impl LlamaManager {
         if !server.is_file() {
             return Err(crate::tr!("Не знайдено llama-server: {}", "llama-server not found: {}", server.display()));
         }
-        if !std::path::Path::new(l.model_path.trim()).is_file() {
-            return Err(crate::tr!("Не знайдено модель GGUF: {}", "GGUF model not found: {}", l.model_path));
-        }
         let port = port_of(&cfg.base_url).ok_or_else(|| t("В адресі немає порту", "The address has no port").to_string())?;
         let mut cmd = Command::new(server);
-        cmd.args(["-m", l.model_path.trim(), "--host", "127.0.0.1", "--port", &port.to_string()]);
-        if l.ctx_size > 0 {
-            cmd.args(["-c", &l.ctx_size.to_string()]);
-        }
-        if l.gpu_layers != 0 {
-            cmd.args(["-ngl", &l.gpu_layers.to_string()]);
+        if is_ollama(server) {
+            cmd.arg("serve").env("OLLAMA_HOST", format!("127.0.0.1:{port}"));
+        } else {
+            if !std::path::Path::new(l.model_path.trim()).is_file() {
+                return Err(crate::tr!("Не знайдено модель GGUF: {}", "GGUF model not found: {}", l.model_path));
+            }
+            cmd.args(["-m", l.model_path.trim(), "--host", "127.0.0.1", "--port", &port.to_string()]);
+            if !l.mmproj_path.trim().is_empty() {
+                cmd.args(["--mmproj", l.mmproj_path.trim()]);
+            }
+            if l.ctx_size > 0 {
+                cmd.args(["-c", &l.ctx_size.to_string()]);
+            }
+            if l.gpu_layers != 0 {
+                cmd.args(["-ngl", &l.gpu_layers.to_string()]);
+            }
+            // Thinking costs seconds a live answer does not have. An env var, because older builds reject the flag; they ignore this.
+            cmd.env("LLAMA_ARG_REASONING", "off");
         }
         if let Some(dir) = server.parent() {
+            crate::proc::ensure_vc_runtime(dir);
             cmd.current_dir(dir);
         }
         cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
@@ -149,7 +159,75 @@ impl LlamaManager {
     }
 }
 
+fn is_ollama(server: &std::path::Path) -> bool {
+    server.file_stem().is_some_and(|n| n.eq_ignore_ascii_case("ollama"))
+}
+
+/// llama-server answers `/health` (503 while the model loads); Ollama has none, but its model list works once it is up.
 async fn healthy(net: &Net, base_url: &str) -> bool {
-    let Ok(rb) = net.get(&format!("{}/health", root_of(base_url))) else { return false };
-    matches!(rb.timeout(Duration::from_secs(2)).send().await, Ok(r) if r.status().is_success())
+    for url in [format!("{}/health", root_of(base_url)), format!("{}/models", base_url.trim_end_matches('/'))] {
+        if let Ok(rb) = net.get(&url) {
+            if matches!(rb.timeout(Duration::from_secs(2)).send().await, Ok(r) if r.status().is_success()) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+#[cfg(test)]
+mod tests {
+    use tokio_util::sync::CancellationToken;
+
+    use super::*;
+    use crate::discover::{self, Found, Places};
+    use crate::providers::runner::{run_stream, RunOptions};
+    use crate::providers::{create_adapter, AdapterDeps};
+    use crate::types::*;
+
+    /// Live check of the one-click path. `COPILOT_TEST_DIR` holds `llama/` as unpacked from the full exe; the recommended
+    /// small model is downloaded there once: `COPILOT_TEST_DIR=<dir> cargo test live_llama -- --ignored --nocapture`
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn live_llama_end_to_end() {
+        let dir = std::path::PathBuf::from(std::env::var("COPILOT_TEST_DIR").expect("COPILOT_TEST_DIR"));
+        let net = Net::new();
+        let offer = &discover::OFFERS[0];
+        let dest = dir.join("models").join(offer.file);
+        if !dest.is_file() {
+            std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+            let part = dest.with_extension("gguf.part");
+            let sha = crate::asr::assets::download(&net, offer.url, &part, offer.title, &|_| {}).await.expect("model downloads");
+            assert_eq!(sha, offer.sha256);
+            std::fs::rename(&part, &dest).unwrap();
+        }
+        let places = Places { home: dir.join("nohome"), local_app_data: dir.join("nolocal"), app_data: dir.join("noroaming"), path_env: String::new(), hf_home: None, ollama_models: None, data_dir: dir.clone() };
+        let found = discover::scan_files(&places);
+        println!("found: {found:?}");
+        let Found::Gguf(m) = found.iter().find(|f| matches!(f, Found::Gguf(_))).expect("the model is discovered") else { unreachable!() };
+        let server = places.llama_server().expect("bundled llama-server");
+        let port = crate::proc::free_port().unwrap();
+        let cfg = ProviderConfig {
+            id: "t".into(),
+            label: m.name.clone(),
+            preset: "llamacpp".into(),
+            protocol: ProviderProtocol::Openai,
+            base_url: format!("http://127.0.0.1:{port}/v1"),
+            has_key: false,
+            allow_fallback: false,
+            timeout_ms: 120_000,
+            llama: Some(LlamaLaunch { server_path: server.display().to_string(), model_path: m.path.display().to_string(), ctx_size: 8192, auto_start: true, ..Default::default() }),
+        };
+        let mgr = LlamaManager::default();
+        let t0 = Instant::now();
+        mgr.ensure(&cfg, &net).await.expect("llama-server loads the model");
+        println!("loaded in {:?}", t0.elapsed());
+        let adapter = create_adapter(AdapterDeps { cfg: cfg.clone(), api_key: None, net: net.clone() });
+        let req = ChatRequest { model: m.name.clone(), messages: vec![ChatMessage { role: Role::User, content: "Що таке індекс у базі даних? Одне речення українською.".into(), images: vec![] }], max_tokens: 120, temperature: 0.2 };
+        let r = run_stream(adapter.as_ref(), &req, &CancellationToken::new(), |_| {}, RunOptions::new(120_000)).await.expect("answer");
+        println!("answer ({:?} ms to first token): {}", r.first_token_ms, r.text);
+        assert!(!r.text.trim().is_empty());
+        assert!(!r.text.contains("<think>"));
+        mgr.stop_all();
+    }
 }

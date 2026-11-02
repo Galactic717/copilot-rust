@@ -47,6 +47,22 @@ pub fn spawn_hidden(cmd: &mut Command) -> std::io::Result<Child> {
     Ok(child)
 }
 
+// whisper-server and llama-server are built against the VC++ runtime. build.rs embeds its DLLs, so the sidecars start on
+// a clean Windows without the redistributable installed. Next to the exe wins over System32 only when System32 has none.
+include!(concat!(env!("OUT_DIR"), "/vcrt.rs"));
+
+/// Puts the runtime DLLs beside a sidecar. A failure is only logged: most machines already have the runtime.
+pub fn ensure_vc_runtime(dir: &std::path::Path) {
+    for (name, bytes) in VCRT {
+        let p = dir.join(name);
+        if !p.is_file() {
+            if let Err(e) = std::fs::write(&p, bytes) {
+                crate::db::diag("vcrt_write_failed", serde_json::json!({ "file": name, "error": e.to_string() }));
+            }
+        }
+    }
+}
+
 pub fn free_port() -> std::io::Result<u16> {
     Ok(std::net::TcpListener::bind("127.0.0.1:0")?.local_addr()?.port())
 }

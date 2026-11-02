@@ -1,8 +1,8 @@
 use eframe::egui::{self, RichText};
 
-use super::profile::{answer_lang_options, kind_label, preset_label, start_import};
-use super::providers::{start_test, test_result, FormResult, ModelPicker, ProviderForm};
-use super::settings_page::{asr_installer, asr_lang_options, device_settings, ui_lang_options, AudioUi};
+use super::profile::{kind_label, preset_label, start_import};
+use super::providers::{local_panel, start_test, test_result, FormResult, LocalUi, ModelPicker, ProviderForm};
+use super::settings_page::{answer_lang_options, asr_installer, asr_lang_options, device_settings, ui_lang_options, AudioUi};
 use super::theme::p;
 use super::widgets::*;
 use super::Ctx;
@@ -26,6 +26,7 @@ pub struct OnboardingState {
     typed: String,
     test_until: Option<std::time::Instant>,
     agree: bool,
+    local: LocalUi,
 }
 
 impl Default for OnboardingState {
@@ -44,6 +45,7 @@ impl Default for OnboardingState {
             typed: String::new(),
             test_until: None,
             agree: false,
+            local: LocalUi::default(),
         }
     }
 }
@@ -158,7 +160,7 @@ fn step_lang(ui: &mut egui::Ui, c: &mut Ctx) {
         field(&mut cols[0], t("Мова інтерфейсу", "Interface language"), |ui| {
             let mut v = s.ui_lang;
             if combo(ui, "onb-ui", &mut v, &ui_lang_options(), ui.available_width()) {
-                let speech = if v == Lang::En { LangPref::En } else { LangPref::Uk };
+                let speech = LangPref::Is(v);
                 core.update_settings(|s| {
                     s.ui_lang = v;
                     s.asr.language = speech;
@@ -198,8 +200,8 @@ fn step_asr(ui: &mut egui::Ui, c: &mut Ctx, st: &mut OnboardingState) {
     note(
         ui,
         t(
-            "Працює локально (whisper.cpp): аудіо не покидає комп'ютер. Потрібно один раз завантажити рушій і модель — розмір і перевірка контрольної суми показані нижче.",
-            "Runs locally (whisper.cpp): audio never leaves the computer. Download the engine and model once — size and checksum verification are shown below.",
+            "Працює локально (whisper.cpp): аудіо не покидає комп'ютер. Повна версія вже містить швидку модель. Точнішу можна завантажити тут один раз, контрольна сума перевіряється.",
+            "Runs locally (whisper.cpp): audio never leaves the computer. The full edition already includes the fast model. A more accurate one can be downloaded here once, with its checksum verified.",
         ),
     );
     asr_installer(ui, c.core, &mut st.audio, true);
@@ -209,13 +211,9 @@ fn step_asr(ui: &mut egui::Ui, c: &mut Ctx, st: &mut OnboardingState) {
 fn step_model(ui: &mut egui::Ui, c: &mut Ctx, st: &mut OnboardingState) {
     let core = c.core.clone();
     h2(ui, t("Модель для відповідей", "Answer model"));
-    note(
-        ui,
-        t(
-            "Свій ключ (BYOK) для будь-якого сервісу — OpenAI, Anthropic, Gemini, OpenRouter, Groq… — або локальна модель llama.cpp без інтернету й без ключа.",
-            "Your own key (BYOK) for any service — OpenAI, Anthropic, Gemini, OpenRouter, Groq… — or a local llama.cpp model with no internet and no key.",
-        ),
-    );
+    local_panel(ui, &core, &mut st.local);
+    ui.add_space(6.0);
+    note(ui, t("Або хмарна модель за вашим ключем: OpenAI, Anthropic, Gemini, OpenRouter, Groq та інші.", "Or a cloud model with your own key: OpenAI, Anthropic, Gemini, OpenRouter, Groq and more."));
     let providers = core.registry.list();
     let quick = c.s.role(ModelRole::QuickAnswer).cloned().or_else(|| c.s.roles.get(&ModelRole::QuickAnswer).cloned().flatten());
     if providers.is_empty() || st.adding {

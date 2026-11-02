@@ -28,6 +28,8 @@ pub trait SessionDeps: Send + Sync {
     fn emit(&self);
     fn log(&self, kind: &str, data: Value);
     fn outcome(&self, provider_id: &str, model: &str, ok: bool);
+    /// A new or revised question became active.
+    fn on_question(&self, _q: &QuestionEvent) {}
     fn new_id(&self) -> String {
         new_id()
     }
@@ -104,6 +106,8 @@ pub fn empty_snapshot() -> AppSnapshot {
         budget_blocked: None,
         levels: [0.0, 0.0],
         notice: None,
+        translation: None,
+        mode: None,
     }
 }
 
@@ -219,6 +223,8 @@ impl SessionManager {
         snap.segments.clear();
         snap.budget_blocked = None;
         snap.notice = None;
+        snap.translation = None;
+        snap.mode = Some(mode);
         self.sync_cost(st);
         self.d.emit();
         id
@@ -264,6 +270,7 @@ impl SessionManager {
         snap.status.mic = off();
         snap.status.system = off();
         snap.levels = [0.0, 0.0];
+        snap.mode = None;
         st.coord = None;
         st.started_at = 0;
         self.d.emit();
@@ -374,6 +381,29 @@ impl SessionManager {
         self.handle(&mut st, dec, Via::Manual);
     }
 
+    /// Mock interview: the question becomes active, and no answer is generated for it.
+    pub fn pose_question(&self, text: &str) {
+        let mut st = self.st.lock().unwrap();
+        let Some(c) = st.coord.as_mut() else { return };
+        if let Decision::New { question, .. } | Decision::Revise(question) = c.manual(QuestionTrigger::Typed, Some(text)) {
+            self.apply_question(&mut st, &question);
+            st.snap.state = ConvState::QuestionConfirmed;
+        }
+        self.sync_questions(&mut st);
+        self.d.emit();
+    }
+
+    /// What the user said after the active question was asked.
+    pub fn speech_since_question(&self) -> String {
+        let st = self.st.lock().unwrap();
+        let Some(q) = st.coord.as_ref().and_then(|c| c.active()) else { return String::new() };
+        st.finals.iter().filter(|f| f.source == Source::User && f.end_ms > q.end_ms).map(|f| f.text.as_str()).collect::<Vec<_>>().join(" ")
+    }
+
+    pub fn persisting(&self) -> bool {
+        self.st.lock().unwrap().persist
+    }
+
     pub fn confirm_candidate(self: &Arc<Self>, id: &str) {
         let mut st = self.st.lock().unwrap();
         if let Some(c) = st.coord.as_mut() {
@@ -473,6 +503,8 @@ impl SessionManager {
             }
         }
         st.board.set_active(Some(&q.question_id), q.revision);
+        st.snap.translation = None;
+        self.d.on_question(q);
         if q.supersedes.is_some() {
             st.snap.state = ConvState::Superseded;
         }

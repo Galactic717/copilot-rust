@@ -4,9 +4,9 @@ use std::sync::Mutex;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 
-use crate::types::{ProviderConfig, Settings};
+use crate::types::{Lang, LangPref, ProviderConfig, Settings};
 
-/// Presets the old build supported and this one dropped (Ollama, LM Studio): their entries are removed on load.
+/// Presets the Electron build had. Their entries are removed on load; a running Ollama or LM Studio now comes in through discovery.
 const REMOVED_PRESETS: [&str; 2] = ["ollama", "lmstudio"];
 
 fn read_json<T: DeserializeOwned>(path: &Path) -> Option<T> {
@@ -29,7 +29,13 @@ pub struct SettingsStore {
 
 impl SettingsStore {
     pub fn open(settings_path: PathBuf, providers_path: PathBuf) -> Self {
+        let first_run = !settings_path.exists();
         let mut settings: Settings = read_json(&settings_path).unwrap_or_default();
+        if first_run {
+            // Without this a German Windows would open in Ukrainian.
+            settings.ui_lang = Lang::from_system(&crate::win::system_locale());
+            settings.asr.language = LangPref::Is(settings.ui_lang);
+        }
         let mut providers: Vec<ProviderConfig> = read_json(&providers_path).unwrap_or_default();
         let removed: Vec<String> = providers.iter().filter(|p| REMOVED_PRESETS.contains(&p.preset.as_str())).map(|p| p.id.clone()).collect();
         if !removed.is_empty() {
@@ -73,7 +79,6 @@ impl SettingsStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{Lang, LangPref};
 
     #[test]
     fn old_russian_settings_load_as_ukrainian_and_drop_removed_presets() {
@@ -91,9 +96,9 @@ mod tests {
         .unwrap();
         let s = SettingsStore::open(dir.join("settings.json"), dir.join("providers.json"));
         let st = s.get();
-        assert_eq!(st.ui_lang, Lang::Uk);
-        assert_eq!(st.answer_lang, LangPref::Uk);
-        assert_eq!(st.asr.language, LangPref::Uk);
+        assert_eq!(st.ui_lang, Lang::UK);
+        assert_eq!(st.answer_lang, LangPref::UK);
+        assert_eq!(st.asr.language, LangPref::UK);
         assert_eq!(st.asr.model, "small");
         assert_eq!(st.asr.threads, 6, "missing fields fall back to defaults");
         assert!(s.providers().is_empty());

@@ -76,8 +76,22 @@ pub fn semibold(size: f32) -> FontId {
     FontId::new(size, FontFamily::Name(SEMIBOLD.into()))
 }
 
-/// Segoe UI from Windows (falls back to egui's bundled fonts if missing), Consolas for code, symbol/emoji fallbacks.
-pub fn install_fonts(ctx: &egui::Context) {
+/// Windows fonts for scripts Segoe UI lacks, each with stand-ins. Loaded only when a chosen language needs them: the CJK
+/// collections are tens of megabytes. egui does not shape text, so Arabic and Indic scripts show their letters but not joined forms.
+fn script_fonts(lang: &str) -> &'static [&'static str] {
+    match lang {
+        "zh" => &["msyh.ttc", "simsun.ttc"],
+        "ja" => &["YuGothM.ttc", "meiryo.ttc", "msgothic.ttc"],
+        "ko" => &["malgun.ttf"],
+        "th" => &["LeelawUI.ttf", "tahoma.ttf"],
+        "hi" | "bn" | "ta" | "te" => &["Nirmala.ttf"],
+        _ => &[],
+    }
+}
+
+/// Segoe UI from Windows (falls back to egui's bundled fonts if missing), Consolas for code, symbol/emoji fallbacks,
+/// and whatever `langs` need. "auto" means speech may come in any language, so every script is loaded.
+pub fn install_fonts(ctx: &egui::Context, langs: &[&str]) {
     let mut fonts = FontDefinitions::default();
     let dir = std::path::PathBuf::from(std::env::var("WINDIR").unwrap_or_else(|_| "C:\\Windows".into())).join("Fonts");
     let mut load = |name: &str, file: &str| -> bool {
@@ -89,6 +103,7 @@ pub fn install_fonts(ctx: &egui::Context) {
             Err(_) => false,
         }
     };
+    let dir = &dir;
     let ui = load("segoe", "segoeui.ttf");
     let sb = load("segoe-sb", "seguisb.ttf");
     let mono = load("consolas", "consola.ttf");
@@ -104,6 +119,33 @@ pub fn install_fonts(ctx: &egui::Context) {
     if emoji {
         prop.push("segoe-emoji".into());
     }
+    // The first language wins for shared Han characters: Chinese and Japanese draw them differently.
+    let mut wanted: Vec<&str> = langs.to_vec();
+    if langs.contains(&"auto") {
+        wanted.extend(["zh", "ja", "ko", "th", "hi"]);
+    }
+    let mut extra = Vec::new();
+    for l in wanted {
+        if let Some(file) = script_fonts(l).iter().find(|f| dir.join(f).is_file()) {
+            if !extra.iter().any(|(_, x)| x == file) {
+                extra.push((format!("script-{file}"), *file));
+            }
+        }
+    }
+    let mut extra_names = Vec::new();
+    for (name, file) in &extra {
+        if let Ok(bytes) = std::fs::read(dir.join(file)) {
+            fonts.font_data.insert(name.clone(), Arc::new(FontData::from_owned(bytes)));
+            extra_names.push(name.clone());
+        }
+    }
+    let prop = fonts.families.entry(FontFamily::Proportional).or_default();
+    prop.extend(extra_names.iter().cloned());
+    // A Chinese, Japanese or Korean UI takes Latin and digits from the same font too: mixed fonts sit on different baselines.
+    if let Some(i) = langs.first().filter(|l| matches!(**l, "zh" | "ja" | "ko")).and_then(|_| extra_names.first()).and_then(|n| prop.iter().position(|x| x == n)) {
+        let first = prop.remove(i);
+        prop.insert(0, first);
+    }
     let prop_list = prop.clone();
     let monos = fonts.families.entry(FontFamily::Monospace).or_default();
     if mono {
@@ -112,6 +154,7 @@ pub fn install_fonts(ctx: &egui::Context) {
     if ui {
         monos.push("segoe".into());
     }
+    monos.extend(extra_names);
     let mut semi = if sb { vec!["segoe-sb".to_string()] } else { Vec::new() };
     semi.extend(prop_list);
     fonts.families.insert(FontFamily::Name(SEMIBOLD.into()), semi);

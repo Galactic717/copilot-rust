@@ -196,6 +196,9 @@ pub fn show(ui: &mut egui::Ui, core: &Arc<Core>, state: &Arc<Mutex<OverlayUi>>) 
                         text += t(" · уточнено", " · refined");
                     }
                     ui.add(egui::Label::new(RichText::new(text).size(size * 0.93).color(c.muted)).wrap());
+                    if let Some(tr) = &snap.translation {
+                        ui.add(egui::Label::new(RichText::new(tr).size(size * 0.93).color(c.faint)).wrap());
+                    }
                 } else if let Some(l) = &live {
                     ui.add(egui::Label::new(RichText::new(l).size(size * 0.93).color(c.faint)).wrap());
                 }

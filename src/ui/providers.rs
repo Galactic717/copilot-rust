@@ -7,6 +7,7 @@ use super::theme::p;
 use super::widgets::*;
 use super::Ctx;
 use crate::core::Core;
+use crate::discover::{self, Found, ModelOffer, OFFERS};
 use crate::i18n::t;
 use crate::llama::LlamaState;
 use crate::net::is_loopback_url;
@@ -47,7 +48,7 @@ pub struct ProviderForm {
 
 impl ProviderForm {
     pub fn new(initial: Option<ProviderConfig>) -> Self {
-        let pr = preset(initial.as_ref().map(|c| c.preset.as_str()).unwrap_or("llamacpp"));
+        let pr = preset(initial.as_ref().map(|c| c.preset.as_str()).unwrap_or("openai"));
         Self {
             preset: pr.id.into(),
             label: initial.as_ref().map(|c| c.label.clone()).unwrap_or_else(|| preset_label(pr).into()),
@@ -55,7 +56,7 @@ impl ProviderForm {
             key: String::new(),
             allow_fallback: initial.as_ref().is_some_and(|c| c.allow_fallback),
             timeout_ms: initial.as_ref().map(|c| c.timeout_ms).unwrap_or_else(|| pr.default_timeout_ms()),
-            llama: initial.as_ref().and_then(|c| c.llama.clone()).unwrap_or(LlamaLaunch { ctx_size: 8192, gpu_layers: 99, auto_start: true, ..Default::default() }),
+            llama: initial.as_ref().and_then(|c| c.llama.clone()).unwrap_or(LlamaLaunch { ctx_size: 8192, auto_start: true, ..Default::default() }),
             initial,
             err: None,
             warn: None,
@@ -210,7 +211,7 @@ impl ProviderForm {
             }
             ui.horizontal(|ui| {
                 field(ui, t("Контекст, токенів", "Context, tokens"), |ui| ui.add(egui::DragValue::new(&mut self.llama.ctx_size).range(0..=262_144).speed(256)));
-                field(ui, t("Шарів на GPU (-ngl)", "GPU layers (-ngl)"), |ui| ui.add(egui::DragValue::new(&mut self.llama.gpu_layers).range(0..=999)));
+                field(ui, t("Шарів на GPU (0 — авто)", "GPU layers (0 — auto)"), |ui| ui.add(egui::DragValue::new(&mut self.llama.gpu_layers).range(0..=999)));
             });
             toggle(ui, &mut self.llama.auto_start, t("Запускати автоматично на початку сесії", "Start automatically when a session starts"), None);
             if let Some(cfg) = &self.initial {
@@ -218,6 +219,144 @@ impl ProviderForm {
             }
         });
     }
+}
+
+#[derive(Default)]
+pub struct LocalUi {
+    using: Option<Promise<Result<(), String>>>,
+    err: Option<String>,
+    show_offers: bool,
+    show_all: bool,
+}
+
+fn gb(bytes: u64) -> String {
+    format!("{:.1} GB", bytes as f64 / 1e9)
+}
+
+fn use_it(st: &mut LocalUi, core: &Arc<Core>, f: Found, model: Option<String>) {
+    let c2 = core.clone();
+    st.err = None;
+    st.using = Some(Promise::spawn(core, async move { c2.use_found(&f, model).await }));
+}
+
+fn install_it(st: &mut LocalUi, core: &Arc<Core>, offer: &'static ModelOffer) {
+    core.local_install.lock().unwrap().busy = true;
+    let c2 = core.clone();
+    st.err = None;
+    st.using = Some(Promise::spawn(core, async move { c2.install_offer(offer).await }));
+}
+
+/// Is this found item what answers are coming from right now?
+fn is_active(core: &Core, s: &Settings, f: &Found, model: Option<&str>) -> bool {
+    let Some(role) = s.role(ModelRole::QuickAnswer) else { return false };
+    let Some(cfg) = core.registry.get(&role.provider_id) else { return false };
+    match f {
+        Found::Server { base_url, .. } | Found::Stopped { base_url, .. } => &cfg.base_url == base_url && model == Some(role.model.as_str()),
+        Found::Gguf(m) => cfg.llama.is_some_and(|l| l.model_path == m.path.display().to_string()),
+    }
+}
+
+/// Everything local in one place: found models with a one-click "use", and a recommended download when there is nothing.
+pub fn local_panel(ui: &mut egui::Ui, core: &Arc<Core>, st: &mut LocalUi) {
+    if let Some(r) = st.using.as_ref().and_then(|p| p.take()) {
+        st.using = None;
+        st.err = r.err();
+    }
+    let found = core.found.lock().unwrap().clone();
+    let scanning = core.scanning.load(std::sync::atomic::Ordering::SeqCst);
+    let busy = st.using.is_some();
+    let s = core.s();
+    let ram = crate::win::total_ram();
+    card_fill(ui, p().surface2, |ui| {
+        ui.horizontal(|ui| {
+            h3(ui, t("Локальні моделі на цьому комп'ютері", "Local models on this computer"));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if button(ui, if scanning { t("Шукаю…", "Searching…") } else { t("Шукати ще раз", "Search again") }, Kind::Ghost, true, !scanning).clicked() {
+                    core.rescan_local();
+                }
+            });
+        });
+        // One row per model: a runtime with five models is five choices.
+        let mut rows: Vec<(Found, Option<String>)> = Vec::new();
+        for f in found.iter().flatten() {
+            match f {
+                Found::Server { models, .. } | Found::Stopped { models, .. } => rows.extend(models.iter().map(|m| (f.clone(), Some(m.clone())))),
+                Found::Gguf(_) => rows.push((f.clone(), None)),
+            }
+        }
+        let total = rows.len();
+        if total == 0 {
+            note(ui, if found.is_none() || scanning {
+                t("Шукаю Ollama, LM Studio, Jan, GPT4All, llama.cpp і файли GGUF…", "Looking for Ollama, LM Studio, Jan, GPT4All, llama.cpp and GGUF files…")
+            } else {
+                t("Нічого не знайдено. Можна завантажити рекомендовану модель: вона працює без інтернету й без ключа.", "Nothing found. You can download a recommended model: it works with no internet and no key.")
+            });
+        }
+        for (f, model) in rows.iter().take(if st.show_all { total } else { 5 }) {
+            ui.horizontal(|ui| {
+                let (origin, name, detail) = match f {
+                    Found::Server { runtime, .. } => (*runtime, model.clone().unwrap_or_default(), t("працює", "running").to_string()),
+                    Found::Stopped { runtime, .. } => (*runtime, model.clone().unwrap_or_default(), t("запуститься автоматично", "starts automatically").to_string()),
+                    Found::Gguf(m) => (m.origin, m.name.clone(), if m.mmproj.is_some() { format!("{} · vision", gb(m.size)) } else { gb(m.size) }),
+                };
+                chip(ui, origin, false);
+                ui.add(egui::Label::new(RichText::new(name).strong()).truncate());
+                ui.label(faint(detail));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if is_active(core, &s, f, model.as_deref()) {
+                        chip(ui, t("використовується", "in use"), true);
+                    } else if button(ui, t("Використати", "Use"), Kind::Primary, true, !busy).clicked() {
+                        use_it(st, core, f.clone(), model.clone());
+                    }
+                    if let Found::Gguf(m) = f {
+                        if !discover::fits(m.size, ram) {
+                            chip(ui, t("може не вистачити пам'яті", "may not fit in memory"), false);
+                        }
+                    }
+                });
+            });
+        }
+        if total > 5 && !st.show_all && ghost_sm(ui, &tr!("Показати всі ({})", "Show all ({})", total)) {
+            st.show_all = true;
+        }
+        if total > 0 && !st.show_offers && ghost_sm(ui, t("Завантажити іншу модель", "Download another model")) {
+            st.show_offers = true;
+        }
+        if (total == 0 && found.is_some() && !scanning) || st.show_offers {
+            offers(ui, core, st, ram, busy);
+        }
+        error_text(ui, &st.err);
+    });
+}
+
+fn offers(ui: &mut egui::Ui, core: &Arc<Core>, st: &mut LocalUi, ram: u64, busy: bool) {
+    const GIB: u64 = 1_073_741_824;
+    // The biggest one that runs comfortably: 8 GB Windows reports as 7.x, hence the slack.
+    let best = OFFERS.iter().rev().find(|o| ram + GIB >= o.min_ram_gb * GIB).map(|o| o.id);
+    ui.columns(OFFERS.len(), |cols| {
+        for (i, o) in OFFERS.iter().enumerate() {
+            let ui = &mut cols[i];
+            egui::Frame::new().fill(p().surface).stroke(egui::Stroke::new(1.0, if best == Some(o.id) { p().accent } else { p().border })).corner_radius(8).inner_margin(egui::Margin::same(10)).show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(o.title).strong());
+                    if best == Some(o.id) {
+                        chip(ui, t("рекомендовано", "recommended"), true);
+                    }
+                });
+                ui.label(faint(tr!("{} · від {} ГБ пам'яті · Apache 2.0", "{} · {} GB RAM or more · Apache 2.0", gb(o.bytes), o.min_ram_gb)));
+                if button(ui, t("Завантажити й використати", "Download and use"), Kind::Normal, true, !busy).clicked() {
+                    install_it(st, core, o);
+                }
+            });
+        }
+    });
+    if let Some(d) = core.local_install.lock().unwrap().download.clone() {
+        ui.label(small(tr!("Завантаження: {} — {} / {}", "Downloading: {} — {} / {}", d.name, gb(d.received), if d.total > 0 { gb(d.total) } else { "?".into() })));
+        progress(ui, if d.total > 0 { d.received as f32 / d.total as f32 } else { 0.05 });
+        ui.ctx().request_repaint_after(std::time::Duration::from_millis(300));
+    }
+    note(ui, t("Перервалося — натисніть ще раз: завантаження продовжиться. Цілісність перевіряється за SHA-256.", "Interrupted — click again and the download continues. Integrity is verified by SHA-256."));
 }
 
 /// Status line + start/stop for a saved llama.cpp provider.
@@ -424,12 +563,15 @@ pub struct ProvidersState {
     roles: HashMap<ModelRole, RoleUi>,
     keys: HashMap<String, String>,
     key_err: Option<String>,
+    local: LocalUi,
 }
 
 pub fn show(ui: &mut egui::Ui, c: &mut Ctx, st: &mut ProvidersState) {
     let core = c.core.clone();
     let providers = core.registry.list();
 
+    local_panel(ui, &core, &mut st.local);
+    ui.add_space(10.0);
     let add = std::cell::Cell::new(false);
     section(
         ui,
@@ -473,7 +615,7 @@ pub fn show(ui: &mut egui::Ui, c: &mut Ctx, st: &mut ProvidersState) {
                 }
             }
             if providers.is_empty() && st.editing.is_none() {
-                note(ui, t("Поки немає. Для роботи без інтернету виберіть llama.cpp.", "None yet. To work without internet pick llama.cpp."));
+                note(ui, t("Поки немає. Для роботи без інтернету виберіть локальну модель вище.", "None yet. To work without internet pick a local model above."));
             }
         },
     );

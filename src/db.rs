@@ -32,7 +32,7 @@ CREATE TABLE usage_events(id TEXT PRIMARY KEY, session_id TEXT, provider TEXT, m
   input_tokens INTEGER, output_tokens INTEGER, cost_usd REAL);
 CREATE INDEX ix_usage_at ON usage_events(at);
 CREATE TABLE app_diagnostics(id INTEGER PRIMARY KEY AUTOINCREMENT, at INTEGER, kind TEXT, data TEXT);
-"#];
+"#, "ALTER TABLE sessions ADD COLUMN summary TEXT;"];
 
 pub type Row = Map<String, Value>;
 
@@ -202,9 +202,9 @@ impl Db {
             let like = format!("%{q}%");
             self.rows(
                 "SELECT s.*, (SELECT COUNT(DISTINCT id) FROM questions WHERE session_id=s.id) AS qn FROM sessions s
-                 WHERE s.title LIKE ? OR EXISTS (SELECT 1 FROM transcript_segments t WHERE t.session_id=s.id AND t.text LIKE ?)
+                 WHERE s.title LIKE ? OR s.summary LIKE ? OR EXISTS (SELECT 1 FROM transcript_segments t WHERE t.session_id=s.id AND t.text LIKE ?)
                  ORDER BY started_at DESC LIMIT ?",
-                &[&like, &like, &limit],
+                &[&like, &like, &like, &limit],
             )
         };
         rows.iter()
@@ -217,6 +217,10 @@ impl Db {
                 questions: i(r, "qn"),
             })
             .collect()
+    }
+
+    pub fn set_summary(&self, id: &str, text: &str) {
+        self.exec("UPDATE sessions SET summary=? WHERE id=?", &[&text, &id]);
     }
 
     pub fn session_detail(&self, id: &str) -> HistoryDetail {

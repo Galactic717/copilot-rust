@@ -75,7 +75,14 @@ pub fn ocr_installed() -> bool {
 }
 
 /// WinRT needs an MTA thread; the UI thread is STA (OLE drag-and-drop), so every call runs on its own thread.
+/// The MTA must outlive those threads: windows-rs caches activation factories, and if the apartment dies with the thread
+/// the next call dereferences a dead factory and the whole process goes down with an access violation.
 fn with_winrt<R: Send>(f: impl FnOnce() -> R + Send) -> R {
+    static MTA: std::sync::Once = std::sync::Once::new();
+    MTA.call_once(|| {
+        // The cookie is dropped on purpose: the apartment stays up until the process exits.
+        let _ = unsafe { windows::Win32::System::Com::CoIncrementMTAUsage() };
+    });
     std::thread::scope(|s| {
         s.spawn(|| {
             unsafe {
@@ -148,4 +155,17 @@ pub fn crop_png(shot: &Shot, sel: Rect, blurs: &[Rect]) -> Result<(Vec<u8>, imag
     let mut out = std::io::Cursor::new(Vec::new());
     crop.write_to(&mut out, image::ImageFormat::Png).map_err(|e| e.to_string())?;
     Ok((out.into_inner(), crop))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Used to crash the process on the second call.
+    #[test]
+    fn ocr_can_be_asked_more_than_once() {
+        let first = ocr_languages();
+        assert_eq!(ocr_languages(), first);
+        assert_eq!(ocr_installed(), !first.is_empty());
+    }
 }

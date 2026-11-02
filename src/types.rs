@@ -31,33 +31,144 @@ impl Source {
     }
 }
 
-/// Supported languages. Settings written by the old build may still say "ru": it is read as Ukrainian.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
-#[serde(rename_all = "lowercase")]
-pub enum Lang {
-    #[default]
-    #[serde(alias = "ru")]
-    Uk,
-    En,
+pub struct LangInfo {
+    pub code: &'static str,
+    pub native: &'static str,
+    pub english: &'static str,
+    /// Has a UI catalog in `locales/`. All the others are for speech and answers only.
+    pub ui: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "lowercase")]
+const fn li(code: &'static str, native: &'static str, english: &'static str, ui: bool) -> LangInfo {
+    LangInfo { code, native, english, ui }
+}
+
+/// Codes are whisper.cpp's. Russian is left out on purpose; the rest of whisper's list is what real interviews and meetings use.
+pub static LANGS: &[LangInfo] = &[
+    li("uk", "Українська", "Ukrainian", true),
+    li("en", "English", "English", true),
+    li("de", "Deutsch", "German", true),
+    li("es", "Español", "Spanish", true),
+    li("fr", "Français", "French", true),
+    li("it", "Italiano", "Italian", true),
+    li("pt", "Português", "Portuguese", true),
+    li("pl", "Polski", "Polish", true),
+    li("tr", "Türkçe", "Turkish", true),
+    li("zh", "中文", "Chinese", true),
+    li("ja", "日本語", "Japanese", true),
+    li("ko", "한국어", "Korean", true),
+    li("nl", "Nederlands", "Dutch", false),
+    li("cs", "Čeština", "Czech", false),
+    li("sk", "Slovenčina", "Slovak", false),
+    li("ro", "Română", "Romanian", false),
+    li("hu", "Magyar", "Hungarian", false),
+    li("bg", "Български", "Bulgarian", false),
+    li("hr", "Hrvatski", "Croatian", false),
+    li("sr", "Српски", "Serbian", false),
+    li("sl", "Slovenščina", "Slovenian", false),
+    li("lt", "Lietuvių", "Lithuanian", false),
+    li("lv", "Latviešu", "Latvian", false),
+    li("et", "Eesti", "Estonian", false),
+    li("fi", "Suomi", "Finnish", false),
+    li("sv", "Svenska", "Swedish", false),
+    li("no", "Norsk", "Norwegian", false),
+    li("da", "Dansk", "Danish", false),
+    li("el", "Ελληνικά", "Greek", false),
+    li("ca", "Català", "Catalan", false),
+    li("he", "עברית", "Hebrew", false),
+    li("ar", "العربية", "Arabic", false),
+    li("fa", "فارسی", "Persian", false),
+    li("hi", "हिन्दी", "Hindi", false),
+    li("bn", "বাংলা", "Bengali", false),
+    li("ur", "اردو", "Urdu", false),
+    li("ta", "தமிழ்", "Tamil", false),
+    li("te", "తెలుగు", "Telugu", false),
+    li("id", "Bahasa Indonesia", "Indonesian", false),
+    li("ms", "Bahasa Melayu", "Malay", false),
+    li("vi", "Tiếng Việt", "Vietnamese", false),
+    li("th", "ไทย", "Thai", false),
+    li("ka", "ქართული", "Georgian", false),
+    li("hy", "Հայերեն", "Armenian", false),
+    li("az", "Azərbaycanca", "Azerbaijani", false),
+    li("kk", "Қазақша", "Kazakh", false),
+    li("be", "Беларуская", "Belarusian", false),
+];
+
+/// A language from `LANGS`, kept as its code. Settings written by the old build may still say "ru": it is read as Ukrainian.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Lang(&'static str);
+
+impl Lang {
+    pub const UK: Lang = Lang("uk");
+    pub const EN: Lang = Lang("en");
+
+    pub fn parse(code: &str) -> Option<Lang> {
+        if code == "ru" {
+            return Some(Lang::UK);
+        }
+        LANGS.iter().find(|l| l.code == code).map(|l| Lang(l.code))
+    }
+    pub fn code(self) -> &'static str {
+        self.0
+    }
+    fn info(self) -> &'static LangInfo {
+        LANGS.iter().find(|l| l.code == self.0).expect("Lang is only built from LANGS")
+    }
+    pub fn english(self) -> &'static str {
+        self.info().english
+    }
+    /// The language for a first run: the Windows language when the UI has it, otherwise English.
+    pub fn from_system(code: &str) -> Lang {
+        let base = code.split(['-', '_']).next().unwrap_or("").to_lowercase();
+        LANGS.iter().find(|l| l.ui && l.code == base).map(|l| Lang(l.code)).unwrap_or(Lang::EN)
+    }
+}
+
+impl Default for Lang {
+    fn default() -> Self {
+        Lang::UK
+    }
+}
+
+impl Serialize for Lang {
+    fn serialize<S: serde::Serializer>(&self, ser: S) -> Result<S::Ok, S::Error> {
+        ser.serialize_str(self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for Lang {
+    fn deserialize<D: serde::Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
+        Ok(Lang::parse(&String::deserialize(de)?).unwrap_or(Lang::EN))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum LangPref {
     #[default]
     Auto,
-    #[serde(alias = "ru")]
-    Uk,
-    En,
+    Is(Lang),
 }
 
 impl LangPref {
+    pub const UK: LangPref = LangPref::Is(Lang::UK);
+
     pub fn code(self) -> &'static str {
         match self {
             LangPref::Auto => "auto",
-            LangPref::Uk => "uk",
-            LangPref::En => "en",
+            LangPref::Is(l) => l.code(),
         }
+    }
+}
+
+impl Serialize for LangPref {
+    fn serialize<S: serde::Serializer>(&self, ser: S) -> Result<S::Ok, S::Error> {
+        ser.serialize_str(self.code())
+    }
+}
+
+impl<'de> Deserialize<'de> for LangPref {
+    fn deserialize<D: serde::Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
+        Ok(Lang::parse(&String::deserialize(de)?).map(LangPref::Is).unwrap_or(LangPref::Auto))
     }
 }
 
@@ -171,6 +282,8 @@ pub enum AnswerKind {
     Points,
     Deep,
     Screen,
+    /// Mock interview: a review of the user's own answer. Never streamed through the answer board, only stored.
+    Feedback,
 }
 
 impl AnswerKind {
@@ -180,6 +293,7 @@ impl AnswerKind {
             AnswerKind::Points => "points",
             AnswerKind::Deep => "deep",
             AnswerKind::Screen => "screen",
+            AnswerKind::Feedback => "feedback",
         }
     }
 }
@@ -301,7 +415,10 @@ pub enum ProviderProtocol {
 pub struct LlamaLaunch {
     pub server_path: String,
     pub model_path: String,
+    /// Multimodal projector that lets a local model see screenshots; empty for a text-only model.
+    pub mmproj_path: String,
     pub ctx_size: u32,
+    /// 0 leaves it to llama-server, which fits the layers into the available VRAM on its own.
     pub gpu_layers: i32,
     pub auto_start: bool,
 }
@@ -689,7 +806,7 @@ impl Default for AsrSettings {
         Self {
             backend: AsrBackend::Cpu,
             model: "base".into(),
-            language: LangPref::Uk,
+            language: LangPref::UK,
             vocabulary: ["PostgreSQL", "FastAPI", "Kubernetes", "Docker", "React", "TypeScript"].map(String::from).to_vec(),
             threads: 6,
         }
@@ -747,13 +864,19 @@ pub struct Settings {
     pub active_profile_id: String,
     pub consent: Consent,
     pub window: WindowSettings,
+    /// Once per start GET the latest release from GitHub. The only request the app makes on its own.
+    pub check_updates: bool,
+    /// Write a debrief when a session ends, if the transcript is long enough to have anything in it.
+    pub auto_debrief: bool,
+    /// Translate each question into the UI language when it was asked in another one.
+    pub translate_questions: bool,
 }
 
 impl Default for Settings {
     fn default() -> Self {
         Self {
             onboarded: false,
-            ui_lang: Lang::Uk,
+            ui_lang: Lang::UK,
             answer_lang: LangPref::Auto,
             offline: false,
             auto_answer: false,
@@ -769,6 +892,9 @@ impl Default for Settings {
             active_profile_id: "default".into(),
             consent: Consent::default(),
             window: WindowSettings::default(),
+            check_updates: true,
+            auto_debrief: true,
+            translate_questions: false,
         }
     }
 }
@@ -875,6 +1001,9 @@ pub struct AppSnapshot {
     pub budget_blocked: Option<String>,
     pub levels: [f32; 2],
     pub notice: Option<String>,
+    /// The active question in the UI language, when `translate_questions` is on.
+    pub translation: Option<String>,
+    pub mode: Option<SessionMode>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -882,6 +1011,8 @@ pub enum SessionMode {
     Practice,
     Live,
     Meeting,
+    /// The app asks, the user answers aloud, the app reviews the answer.
+    Mock,
 }
 
 impl SessionMode {
@@ -890,12 +1021,14 @@ impl SessionMode {
             SessionMode::Practice => "practice",
             SessionMode::Live => "live",
             SessionMode::Meeting => "meeting",
+            SessionMode::Mock => "mock",
         }
     }
     pub fn parse(s: &str) -> Self {
         match s {
             "practice" => SessionMode::Practice,
             "meeting" => SessionMode::Meeting,
+            "mock" => SessionMode::Mock,
             _ => SessionMode::Live,
         }
     }

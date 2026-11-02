@@ -1,6 +1,7 @@
 //! The app core: owns storage, providers, session, ASR, capture and the window side effects. The UI calls into it;
 //! hotkeys and the tray reach it through the UI thread.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
@@ -13,21 +14,23 @@ use tokio_util::sync::CancellationToken;
 use crate::asr::assets::AsrAssets;
 use crate::asr::manager::{AsrConfig, AsrEvents, AsrJob, AsrManager};
 use crate::audio::{AudioChunk, CaptureController, CaptureOptions, CaptureSink};
-use crate::budget::BudgetManager;
-use crate::context::prompt::ScreenInput;
+use crate::budget::{BudgetManager, Gate};
+use crate::context::prompt::{debrief_task, detect_lang, feedback_task, mock_question_task, translate_task, ScreenInput, Task};
 use crate::db::{Db, HistoryDetail};
+use crate::discover::{self, Found, ModelOffer, Places};
 use crate::i18n::t;
 use crate::llama::{LlamaManager, LlamaState};
 use crate::net::{check_endpoint, Net};
 use crate::providers::presets::preset;
 use crate::providers::registry::{ProviderRegistry, ProviderTestReport, ResolvedTarget};
-use crate::providers::runner::{run_stream, RunOptions};
+use crate::providers::runner::{run_stream, RunEvent, RunOptions};
 use crate::screen::Shot;
 use crate::secrets::SecretStore;
 use crate::session::manager::{SessionDeps, SessionManager};
 use crate::settings::SettingsStore;
 use crate::tr;
 use crate::types::*;
+use crate::update::{self, Release};
 use crate::win::{self, Rect};
 
 #[derive(Default)]
@@ -57,6 +60,37 @@ impl UiBridge {
     }
 }
 
+/// A streamed one-off generation the UI can draw while it runs.
+#[derive(Default, Clone)]
+pub struct Gen {
+    pub text: String,
+    pub busy: bool,
+    pub error: Option<String>,
+}
+
+pub type GenSlot = Arc<Mutex<Gen>>;
+
+#[derive(Default)]
+pub struct LocalInstall {
+    pub busy: bool,
+    pub download: Option<Download>,
+    pub error: Option<String>,
+}
+
+#[derive(Default)]
+pub struct UpdateState {
+    pub available: Option<Release>,
+    pub busy: bool,
+    pub download: Option<Download>,
+    pub error: Option<String>,
+}
+
+#[derive(Default)]
+pub struct MockState {
+    pub question: GenSlot,
+    pub feedback: GenSlot,
+}
+
 pub struct Core {
     pub data_dir: PathBuf,
     pub rt: tokio::runtime::Runtime,
@@ -74,6 +108,13 @@ pub struct Core {
     pub interrupted: usize,
     pub shortcut_conflicts: Mutex<Vec<String>>,
     pub ui: UiBridge,
+    /// Local models found on this machine; None until the first scan finishes.
+    pub found: Mutex<Option<Vec<Found>>>,
+    pub scanning: AtomicBool,
+    pub local_install: Mutex<LocalInstall>,
+    pub update: Mutex<UpdateState>,
+    pub debriefs: Mutex<HashMap<String, GenSlot>>,
+    pub mock: MockState,
     ocr: Mutex<Option<bool>>,
     asr_idle: AtomicU64,
     me: Weak<Core>,
@@ -113,6 +154,11 @@ impl SessionDeps for Deps {
     }
     fn log(&self, kind: &str, data: Value) {
         crate::db::diag(kind, data);
+    }
+    fn on_question(&self, q: &QuestionEvent) {
+        if let Some(c) = self.core.upgrade() {
+            c.translate_question(q);
+        }
     }
     fn outcome(&self, provider_id: &str, model: &str, ok: bool) {
         let key = format!("{provider_id}/{model}");
@@ -236,6 +282,12 @@ impl Core {
                 interrupted,
                 shortcut_conflicts: Mutex::new(Vec::new()),
                 ui: UiBridge::default(),
+                found: Mutex::new(None),
+                scanning: AtomicBool::new(false),
+                local_install: Mutex::new(LocalInstall::default()),
+                update: Mutex::new(UpdateState::default()),
+                debriefs: Mutex::new(HashMap::new()),
+                mock: MockState::default(),
                 ocr: Mutex::new(None),
                 asr_idle: AtomicU64::new(0),
                 me: me.clone(),
@@ -251,7 +303,408 @@ impl Core {
             )
             .into()));
         }
+        // A screenshot run must not depend on what happens to be installed here, or reach out to the network.
+        if std::env::var_os("COPILOT_SNAPSHOT").is_none() {
+            core.unpack_components();
+            core.rescan_local();
+            core.check_update();
+        }
         Ok(core)
+    }
+
+    /// One-file edition: unpack the sidecars from the exe on a background thread, with progress in the ASR status.
+    fn unpack_components(&self) {
+        let core = self.arc();
+        std::thread::spawn(move || {
+            let Ok(exe) = std::env::current_exe() else { return };
+            let asr = core.asr.clone();
+            let r = crate::bundle::unpack(&exe, &core.data_dir, &move |d| asr.set_download(Some(d), None));
+            match r {
+                Ok(_) => core.asr.set_download(None, None),
+                Err(e) => {
+                    crate::db::diag("unpack_failed", json!({ "error": e }));
+                    core.asr.set_download(None, Some(tr!("Не вдалося розпакувати компоненти: {}", "Could not unpack components: {}", e)));
+                }
+            }
+            core.rescan_local();
+        });
+    }
+
+    // ---- local models ----
+
+    pub fn places(&self) -> Places {
+        Places::from_env(&self.data_dir)
+    }
+
+    pub fn rescan_local(&self) {
+        if self.scanning.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let core = self.arc();
+        self.rt.spawn(async move {
+            let found = discover::scan(&core.net, &core.places(), win::total_ram()).await;
+            crate::db::diag("local_scan", json!({ "found": found.len() }));
+            *core.found.lock().unwrap() = Some(found);
+            core.scanning.store(false, Ordering::SeqCst);
+            core.emit();
+        });
+    }
+
+    fn set_answer_roles(&self, provider_id: &str, model: &str, vision: bool) {
+        let target = RoleTarget { provider_id: provider_id.into(), model: model.into() };
+        self.update_settings(|s| {
+            s.roles.insert(ModelRole::QuickAnswer, Some(target.clone()));
+            s.roles.insert(ModelRole::DeepAnswer, Some(target.clone()));
+            if vision {
+                s.roles.insert(ModelRole::Vision, Some(target.clone()));
+            }
+        });
+    }
+
+    /// Connects a found model in one step: an existing provider for the same server or file is reused, not duplicated.
+    pub async fn use_found(&self, f: &Found, model: Option<String>) -> Result<(), String> {
+        let existing = self.registry.list();
+        let cfg = match f {
+            Found::Server { runtime, base_url, .. } => existing.iter().find(|p| &p.base_url == base_url).cloned().unwrap_or(ProviderConfig {
+                id: String::new(),
+                label: runtime.to_string(),
+                preset: "custom".into(),
+                protocol: ProviderProtocol::Openai,
+                base_url: base_url.clone(),
+                has_key: false,
+                allow_fallback: false,
+                timeout_ms: 30_000,
+                llama: None,
+            }),
+            Found::Stopped { runtime, exe, base_url, .. } => existing.iter().find(|p| &p.base_url == base_url).cloned().unwrap_or(ProviderConfig {
+                id: String::new(),
+                label: runtime.to_string(),
+                preset: "custom".into(),
+                protocol: ProviderProtocol::Openai,
+                base_url: base_url.clone(),
+                has_key: false,
+                allow_fallback: false,
+                timeout_ms: 30_000,
+                llama: Some(LlamaLaunch { server_path: exe.display().to_string(), auto_start: true, ..Default::default() }),
+            }),
+            Found::Gguf(m) => {
+                let path = m.path.display().to_string();
+                match existing.iter().find(|p| p.llama.as_ref().is_some_and(|l| l.model_path == path)) {
+                    Some(p) => p.clone(),
+                    None => {
+                        let server = self.llama_server().await?;
+                        let port = crate::proc::free_port().map_err(|e| e.to_string())?;
+                        ProviderConfig {
+                            id: String::new(),
+                            label: m.name.clone(),
+                            preset: "llamacpp".into(),
+                            protocol: ProviderProtocol::Openai,
+                            base_url: format!("http://127.0.0.1:{port}/v1"),
+                            has_key: false,
+                            allow_fallback: false,
+                            timeout_ms: 30_000,
+                            llama: Some(LlamaLaunch {
+                                server_path: server.display().to_string(),
+                                model_path: path,
+                                mmproj_path: m.mmproj.as_ref().map(|p| p.display().to_string()).unwrap_or_default(),
+                                ctx_size: 8192,
+                                gpu_layers: 0,
+                                auto_start: true,
+                            }),
+                        }
+                    }
+                }
+            }
+        };
+        let (saved, _) = self.upsert_provider(cfg, None)?;
+        let (model, vision) = match f {
+            Found::Server { models, .. } | Found::Stopped { models, .. } => (model.or_else(|| models.first().cloned()).unwrap_or_default(), true),
+            // llama-server serves the one model it was started with, whatever name the request carries.
+            Found::Gguf(m) => (m.name.clone(), m.mmproj.is_some()),
+        };
+        self.set_answer_roles(&saved.id, &model, vision);
+        self.emit();
+        Ok(())
+    }
+
+    /// The user's llama-server if there is one, otherwise the bundled one; the plain exe downloads it the first time.
+    async fn llama_server(&self) -> Result<PathBuf, String> {
+        if let Some(p) = self.places().llama_server() {
+            return Ok(p);
+        }
+        let (url, sha) = discover::LLAMA_ZIP;
+        let dir = self.data_dir.join("llama");
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        let zip = dir.join("llama.zip.part");
+        let got = crate::asr::assets::download(&self.net, url, &zip, "llama.cpp", &|d| self.local_install.lock().unwrap().download = Some(d)).await?;
+        if got != sha {
+            let _ = std::fs::remove_file(&zip);
+            return Err(tr!("Контрольна сума архіву не збіглася ({}…) — файл видалено", "Archive checksum mismatch ({}…) — file deleted", &got[..12]));
+        }
+        crate::asr::assets::unzip(&zip, &dir)?;
+        let _ = std::fs::remove_file(&zip);
+        self.places().llama_server().ok_or_else(|| t("В архіві немає llama-server.exe", "llama-server.exe is missing from the archive").to_string())
+    }
+
+    /// One click from nothing to a working local model: download, verify, connect.
+    pub async fn install_offer(&self, offer: &'static ModelOffer) -> Result<(), String> {
+        let r = async {
+            let dir = self.data_dir.join("models");
+            std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+            let dest = dir.join(offer.file);
+            if !dest.is_file() {
+                let part = dest.with_extension("gguf.part");
+                let progress = |d: Download| self.local_install.lock().unwrap().download = Some(d);
+                let sha = crate::asr::assets::download(&self.net, offer.url, &part, offer.title, &progress).await?;
+                if sha != offer.sha256 {
+                    let _ = std::fs::remove_file(&part);
+                    return Err(tr!("Контрольна сума моделі не збіглася ({}…) — файл видалено", "Model checksum mismatch ({}…) — file deleted", &sha[..12]));
+                }
+                std::fs::rename(&part, &dest).map_err(|e| e.to_string())?;
+            }
+            let size = std::fs::metadata(&dest).map(|m| m.len()).unwrap_or(offer.bytes);
+            self.use_found(&Found::Gguf(discover::GgufModel { path: dest, name: offer.title.into(), size, mmproj: None, origin: "Copilot" }), None).await
+        }
+        .await;
+        {
+            let mut st = self.local_install.lock().unwrap();
+            st.busy = false;
+            st.download = None;
+            st.error = r.as_ref().err().cloned();
+        }
+        self.rescan_local();
+        self.emit();
+        r
+    }
+
+    // ---- updates ----
+
+    pub fn check_update(&self) {
+        if !self.s().check_updates {
+            return;
+        }
+        let core = self.arc();
+        self.rt.spawn(async move {
+            match update::latest(&core.net).await {
+                Ok(r) => core.update.lock().unwrap().available = r,
+                Err(e) => crate::db::diag("update_check", json!({ "error": e })),
+            }
+            core.emit();
+        });
+    }
+
+    pub fn apply_update(&self) {
+        let Some(rel) = self.update.lock().unwrap().available.clone() else { return };
+        self.update.lock().unwrap().busy = true;
+        let core = self.arc();
+        self.rt.spawn(async move {
+            let c2 = core.clone();
+            let progress = move |d: Download| {
+                c2.update.lock().unwrap().download = Some(d);
+                c2.emit();
+            };
+            let r = update::install(&core.net, &rel, &progress).await.and_then(|exe| win::relaunch(&exe));
+            match r {
+                Ok(()) => core.shutdown(),
+                Err(e) => {
+                    let mut st = core.update.lock().unwrap();
+                    st.busy = false;
+                    st.download = None;
+                    st.error = Some(e);
+                }
+            }
+            core.emit();
+        });
+    }
+
+    // ---- one-off generations: debrief, mock interview, translation ----
+
+    fn target_for(&self, role: ModelRole) -> Option<ResolvedTarget> {
+        let s = self.s();
+        [role, ModelRole::DeepAnswer, ModelRole::QuickAnswer].into_iter().find_map(|r| self.registry.resolve(r, &s))
+    }
+
+    /// Same gates as a live answer (offline, cloud consent, spend limit), without the live flow's rate limits.
+    async fn run_task(&self, role: ModelRole, task: Task, session_id: Option<&str>, mut on_text: impl FnMut(&str) + Send) -> Result<String, String> {
+        let s = self.s();
+        let target = self.target_for(role).ok_or_else(|| t("Не вибрано модель для відповідей — відкрийте «Моделі та ключі»", "No answer model selected — open “Models & keys”").to_string())?;
+        if !target.is_local && s.offline {
+            return Err(t("Офлайн-режим: ця модель працює в хмарі", "Offline mode: this model runs in the cloud").into());
+        }
+        if !target.is_local && !s.consent.cloud {
+            return Err(t("Надсилання в хмару не дозволено — увімкніть його в «Приватність» або виберіть локальну модель", "Sending to the cloud is not allowed — enable it in “Privacy” or pick a local model").into());
+        }
+        if let Gate::Money(reason) = self.budget.lock().unwrap().can_start(target.is_local) {
+            return Err(reason);
+        }
+        self.llama.ensure(&target.cfg, &self.net).await?;
+        self.budget.lock().unwrap().begin();
+        let req = ChatRequest {
+            model: target.model.clone(),
+            messages: vec![ChatMessage { role: Role::System, content: task.system, images: vec![] }, ChatMessage { role: Role::User, content: task.user, images: vec![] }],
+            max_tokens: task.max_tokens,
+            temperature: task.temperature,
+        };
+        // Nothing is waiting on these the way a live answer is, and a cold local model takes its time.
+        let wait = target.cfg.timeout_ms.max(if target.is_local { 120_000 } else { 30_000 });
+        let res = run_stream(target.adapter.as_ref(), &req, &CancellationToken::new(), |e| {
+            if let RunEvent::Text(d) = e {
+                on_text(d);
+            }
+        }, RunOptions::new(wait)).await;
+        match res {
+            Ok(r) => {
+                let usage = (r.usage.input_tokens, r.usage.output_tokens);
+                let cost = self.budget.lock().unwrap().end(&target.cfg.id, &target.model, target.is_local, Some(usage));
+                self.db.add_usage(&new_id(), session_id, &target.cfg.id, &target.model, usage.0, usage.1, cost);
+                Ok(r.text)
+            }
+            Err(e) => {
+                self.budget.lock().unwrap().end(&target.cfg.id, &target.model, target.is_local, None);
+                Err(e.line())
+            }
+        }
+    }
+
+    fn generate(&self, role: ModelRole, task: Task, session_id: Option<String>, slot: GenSlot, done: impl FnOnce(&Core, &str) + Send + 'static) {
+        *slot.lock().unwrap() = Gen { busy: true, ..Default::default() };
+        let core = self.arc();
+        self.rt.spawn(async move {
+            let (s2, c2) = (slot.clone(), core.clone());
+            let r = core
+                .run_task(role, task, session_id.as_deref(), move |d| {
+                    s2.lock().unwrap().text.push_str(d);
+                    c2.emit();
+                })
+                .await;
+            {
+                let mut g = slot.lock().unwrap();
+                g.busy = false;
+                match &r {
+                    Ok(text) => g.text = text.clone(),
+                    Err(e) => g.error = Some(e.clone()),
+                }
+            }
+            if let Ok(text) = &r {
+                done(&core, text);
+            }
+            core.emit();
+        });
+    }
+
+    fn translate_question(&self, q: &QuestionEvent) {
+        let s = self.s();
+        if !s.translate_questions || detect_lang(&q.text) == Some(s.ui_lang) || self.target_for(ModelRole::QuickAnswer).is_none() {
+            return;
+        }
+        let core = self.arc();
+        let (id, revision, text, sid, lang) = (q.question_id.clone(), q.revision, q.text.clone(), q.session_id.clone(), s.ui_lang);
+        self.rt.spawn(async move {
+            match core.run_task(ModelRole::QuickAnswer, translate_task(&text, lang), Some(&sid), |_| {}).await {
+                Ok(tr) => {
+                    core.session.with_snap(|sn| {
+                        if sn.active_question.as_ref().is_some_and(|a| a.question_id == id && a.revision == revision) {
+                            sn.translation = Some(tr.trim().to_string());
+                        }
+                    });
+                    core.emit();
+                }
+                Err(e) => crate::db::diag("translate_failed", json!({ "error": e })),
+            }
+        });
+    }
+
+    fn transcript_lines(&self, id: &str) -> Vec<String> {
+        self.db.session_segments(id).iter().map(|s| format!("{}: {}", if s.source == Source::Remote { "Other side" } else { "Me" }, s.text)).collect()
+    }
+
+    /// Writes (or rewrites) the debrief of a saved session and stores it with the session.
+    pub fn debrief(&self, id: &str) -> GenSlot {
+        let slot = self.debriefs.lock().unwrap().entry(id.to_string()).or_default().clone();
+        if slot.lock().unwrap().busy {
+            return slot;
+        }
+        let mode = self.db.session_detail(id).session.as_ref().map(|r| SessionMode::parse(&crate::db::s(r, "mode"))).unwrap_or(SessionMode::Live);
+        let task = debrief_task(mode, &self.transcript_lines(id), self.s().answer_lang);
+        let sid = id.to_string();
+        self.generate(ModelRole::PostSessionSummary, task, Some(id.to_string()), slot.clone(), move |core, text| core.db.set_summary(&sid, text));
+        slot
+    }
+
+    /// Automatic only when it costs nothing and sends nothing anywhere; for a cloud model the debrief waits for a click in History.
+    fn auto_debrief(&self, id: &str) {
+        let words: usize = self.db.session_segments(id).iter().map(|s| s.text.split_whitespace().count()).sum();
+        if self.s().auto_debrief && words >= 60 && self.target_for(ModelRole::PostSessionSummary).is_some_and(|t| t.is_local) {
+            self.debrief(id);
+        }
+    }
+
+    pub fn mock_next(&self) {
+        if self.session.snapshot().mode != Some(SessionMode::Mock) {
+            self.start_session(SessionMode::Mock);
+        }
+        let snap = self.session.snapshot();
+        let mut asked: Vec<String> = snap.recent_questions.iter().map(|(_, q)| q.clone()).collect();
+        asked.extend(snap.active_question.map(|q| q.text));
+        let s = self.s();
+        let p = self.profile();
+        let lang = if let LangPref::Is(l) = s.answer_lang { l } else { s.ui_lang };
+        *self.mock.feedback.lock().unwrap() = Gen::default();
+        let task = mock_question_task(&p, &self.db.chunks_for_profile(&p.id), &asked, lang);
+        self.generate(ModelRole::QuickAnswer, task, snap.session_id, self.mock.question.clone(), |core, text| core.session.pose_question(text.trim()));
+    }
+
+    /// Reviews what the user said since the question (plus anything typed), and stores the review with the session.
+    pub fn mock_feedback(&self, typed: &str) {
+        let snap = self.session.snapshot();
+        let Some(q) = snap.active_question else { return };
+        let answer = format!("{} {}", self.session.speech_since_question(), typed).trim().to_string();
+        if answer.is_empty() {
+            self.session.notice(Some(t("Спершу дайте відповідь уголос або введіть її текстом.", "Answer aloud or type your answer first.").into()));
+            return;
+        }
+        let s = self.s();
+        let p = self.profile();
+        let lang = if let LangPref::Is(l) = s.answer_lang { l } else { s.ui_lang };
+        let task = feedback_task(&p, &self.db.chunks_for_profile(&p.id), &q.text, &answer, lang);
+        let sid = snap.session_id.clone();
+        self.generate(ModelRole::DeepAnswer, task, snap.session_id, self.mock.feedback.clone(), move |core, text| {
+            let Some(session_id) = sid.filter(|_| core.session.persisting()) else { return };
+            core.db.upsert_answer(&AnswerEvent {
+                session_id,
+                question_id: q.question_id.clone(),
+                revision: q.revision,
+                answer_id: new_id(),
+                kind: AnswerKind::Feedback,
+                provider: String::new(),
+                model: String::new(),
+                prompt_preset: String::new(),
+                text: text.to_string(),
+                status: AnswerStatus::Done,
+                first_token_ms: None,
+                latency_ms: None,
+                usage: None,
+                usage_cost_usd: None,
+                error: None,
+            });
+        });
+    }
+
+    /// A bug report that needs no back-and-forth: versions, settings and the redacted log. No keys, no conversation text.
+    pub fn export_diagnostics(&self, path: &Path) -> Result<(), String> {
+        let providers: Vec<Value> = self.registry.list().iter().map(|p| json!({ "preset": p.preset, "local": crate::net::is_loopback_url(&p.base_url), "hasKey": p.has_key })).collect();
+        let log: Vec<Value> = self.db.recent_diag(500).into_iter().map(|(at, kind, data)| json!({ "at": at, "kind": kind, "data": data })).collect();
+        let st = self.asr.status();
+        let v = json!({
+            "app": env!("CARGO_PKG_VERSION"),
+            "windowsBuild": win::windows_build(),
+            "ramGb": win::total_ram() / 1_073_741_824,
+            "settings": { "uiLang": self.s().ui_lang, "asr": { "backend": self.s().asr.backend, "model": self.s().asr.model, "language": self.s().asr.language }, "offline": self.s().offline, "onboarded": self.s().onboarded },
+            "asr": { "binary": st.binary, "modelPresent": st.model_present, "error": st.error },
+            "providers": providers,
+            "log": log,
+        });
+        std::fs::write(path, crate::redact::redact(&serde_json::to_string_pretty(&v).map_err(|e| e.to_string())?)).map_err(|e| e.to_string())
     }
 
     fn arc(&self) -> Arc<Core> {
@@ -492,11 +945,12 @@ impl Core {
                 session_id: id.clone(),
                 mic_device_id: s.audio.mic_device_id.clone(),
                 capture_mic: s.audio.capture_mic && s.consent.mic,
-                capture_system: s.audio.capture_system && s.consent.system,
+                // In a mock interview the only other voice is a video playing somewhere; it must not count as the interviewer.
+                capture_system: s.audio.capture_system && s.consent.system && mode != SessionMode::Mock,
             },
             self.sink(),
         );
-        if mode != SessionMode::Meeting {
+        if !matches!(mode, SessionMode::Meeting | SessionMode::Mock) {
             self.show_overlay();
         }
         id
@@ -523,7 +977,7 @@ impl Core {
     /// A cold local model costs 20–60 s on its first request, so I load it while the user is still settling in.
     fn warm_local_model(&self) {
         let Some(t) = self.registry.resolve(ModelRole::QuickAnswer, &self.s()) else { return };
-        if !t.is_local {
+        if !t.is_local || t.cfg.llama.as_ref().is_some_and(|l| !l.auto_start) {
             return;
         }
         let core = self.arc();
@@ -550,9 +1004,13 @@ impl Core {
     }
 
     pub fn stop_session(&self) {
+        let id = self.session.session_id().filter(|_| self.session.persisting());
         self.session.stop();
         self.capture.stop();
         self.schedule_asr_idle_stop();
+        if let Some(id) = id {
+            self.auto_debrief(&id);
+        }
     }
 
     pub fn toggle_listen(&self) {
@@ -705,6 +1163,7 @@ impl Core {
                     "The answer provider receives: the current question, the last minutes of transcript, relevant CV/JD fragments and profile notes",
                 )
                 .into(),
+                t("Підсумок сесії отримує весь транскрипт: автоматично лише локальна модель, хмарна — за вашою кнопкою в «Історії»", "A session debrief gets the whole transcript: automatically only a local model, a cloud one on your click in “History”").into(),
                 t("Знімки екрана — лише після вашого виділення й підтвердження", "Screenshots — only after you select and confirm").into(),
                 if st.history && st.consent.history {
                     t("Історія зберігається лише на цьому комп'ютері (SQLite)", "History is stored on this computer only (SQLite)")
@@ -727,9 +1186,6 @@ impl Core {
             cfg.id = new_id()[..8].to_string();
         }
         cfg.protocol = preset(&cfg.preset).protocol;
-        if cfg.preset != "llamacpp" {
-            cfg.llama = None;
-        }
         let saved = self.registry.upsert(cfg, key)?;
         self.llama.stop(&saved.id);
         self.update_llm_status();
@@ -958,5 +1414,174 @@ impl Core {
         self.asr.stop();
         self.llama.stop_all();
         std::process::exit(0);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::{Read, Write};
+    use std::time::{Duration, Instant};
+
+    use super::*;
+
+    /// Answers every POST with the same OpenAI-style stream, and records the request bodies.
+    fn fake_llm(reply: &'static str) -> (u16, Arc<Mutex<Vec<String>>>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let s2 = seen.clone();
+        std::thread::spawn(move || {
+            for sock in listener.incoming().flatten() {
+                let mut sock = sock;
+                let mut req = Vec::new();
+                let mut buf = [0u8; 65536];
+                loop {
+                    let n = sock.read(&mut buf).unwrap_or(0);
+                    req.extend_from_slice(&buf[..n]);
+                    let text = String::from_utf8_lossy(&req);
+                    let done = text.find("\r\n\r\n").is_some_and(|h| {
+                        let len = text[..h].lines().find_map(|l| l.to_lowercase().strip_prefix("content-length:").map(|v| v.trim().parse::<usize>().unwrap_or(0))).unwrap_or(0);
+                        req.len() >= h + 4 + len
+                    });
+                    if n == 0 || done {
+                        break;
+                    }
+                }
+                s2.lock().unwrap().push(String::from_utf8_lossy(&req).into_owned());
+                let body = format!("data: {}\n\ndata: [DONE]\n\n", json!({ "choices": [{ "delta": { "content": reply } }] }));
+                let _ = sock.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes());
+            }
+        });
+        (port, seen)
+    }
+
+    fn core() -> Arc<Core> {
+        // The same switch the screenshot run uses: no unpacking, no scan of this machine, no network.
+        unsafe { std::env::set_var("COPILOT_SNAPSHOT", "1") };
+        let dir = std::env::temp_dir().join(format!("copilot-core-{}", new_id()));
+        Core::new(dir).unwrap()
+    }
+
+    fn wait(slot: &GenSlot) -> Gen {
+        let t0 = Instant::now();
+        loop {
+            let g = slot.lock().unwrap().clone();
+            if !g.busy {
+                return g;
+            }
+            assert!(t0.elapsed() < Duration::from_secs(20), "generation hung");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn seg(session_id: &str, source: Source, start_ms: i64, end_ms: i64, text: &str) -> TranscriptSegment {
+        TranscriptSegment { session_id: session_id.into(), segment_id: new_id(), source, start_ms, end_ms, text: text.into(), is_final: true, lang: None }
+    }
+
+    #[test]
+    fn found_models_connect_in_one_step_without_duplicates() {
+        let c = core();
+        let server = Found::Server { runtime: "Ollama", base_url: "http://127.0.0.1:11434/v1".into(), models: vec!["qwen3:8b".into(), "gemma3:4b".into()] };
+        c.rt.block_on(c.use_found(&server, Some("gemma3:4b".into()))).unwrap();
+        let s = c.s();
+        let quick = s.role(ModelRole::QuickAnswer).unwrap();
+        assert_eq!(quick.model, "gemma3:4b");
+        assert_eq!(s.role(ModelRole::DeepAnswer).unwrap().provider_id, quick.provider_id);
+        assert_eq!(c.registry.get(&quick.provider_id).unwrap().label, "Ollama");
+        assert!(c.registry.resolve(ModelRole::QuickAnswer, &s).unwrap().is_local);
+        // The same server again reuses the provider and only switches the model.
+        c.rt.block_on(c.use_found(&server, Some("qwen3:8b".into()))).unwrap();
+        assert_eq!(c.registry.list().len(), 1);
+        assert_eq!(c.s().role(ModelRole::QuickAnswer).unwrap().model, "qwen3:8b");
+
+        // A GGUF file becomes a llama-server the app runs itself, on a port of its own.
+        std::fs::create_dir_all(c.data_dir.join("llama")).unwrap();
+        std::fs::write(c.data_dir.join("llama/llama-server.exe"), b"").unwrap();
+        let gguf = Found::Gguf(discover::GgufModel { path: c.data_dir.join("m.gguf"), name: "m".into(), size: 1, mmproj: None, origin: "x" });
+        c.rt.block_on(c.use_found(&gguf, None)).unwrap();
+        let cfg = c.registry.get(&c.s().role(ModelRole::QuickAnswer).unwrap().provider_id).unwrap();
+        let launch = cfg.llama.expect("llama launch");
+        assert_eq!(launch.gpu_layers, 0, "VRAM fitting is left to llama-server");
+        assert!(launch.server_path.ends_with("llama-server.exe"));
+        c.rt.block_on(c.use_found(&gguf, None)).unwrap();
+        assert_eq!(c.registry.list().len(), 2, "the same file is not connected twice");
+    }
+
+    #[test]
+    fn mock_interview_flow_and_debrief() {
+        let (port, seen) = fake_llm("Tell me about a hard bug you fixed.");
+        let c = core();
+        c.update_settings(|s| s.consent.history = true);
+        let server = Found::Server { runtime: "Test", base_url: format!("http://127.0.0.1:{port}/v1"), models: vec!["m".into()] };
+        c.rt.block_on(c.use_found(&server, None)).unwrap();
+
+        // The app asks.
+        c.mock_next();
+        let snap = c.session.snapshot();
+        assert_eq!(snap.mode, Some(SessionMode::Mock));
+        assert!(wait(&c.mock.question).error.is_none());
+        let t0 = Instant::now();
+        while c.session.snapshot().active_question.is_none() {
+            assert!(t0.elapsed() < Duration::from_secs(5), "the question never became active");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let snap = c.session.snapshot();
+        assert_eq!(snap.active_question.as_ref().unwrap().text, "Tell me about a hard bug you fixed.");
+        assert!(snap.answers.is_empty(), "a mock question gets no generated answer");
+
+        // No answer yet: a notice instead of a request.
+        let before = seen.lock().unwrap().len();
+        c.mock_feedback("");
+        assert_eq!(seen.lock().unwrap().len(), before);
+        assert!(c.session.snapshot().notice.is_some());
+
+        // The user answers aloud; the review sees the speech.
+        let id = snap.session_id.clone().unwrap();
+        c.session.on_segment(seg(&id, Source::User, 5000, 9000, "I traced a race condition in the payment queue and fixed it with an idempotency key"));
+        assert!(c.session.speech_since_question().contains("idempotency"));
+        c.mock_feedback("");
+        assert!(wait(&c.mock.feedback).error.is_none());
+        assert!(seen.lock().unwrap().last().unwrap().contains("idempotency key"), "the review request carries the answer");
+
+        // The debrief is written from the stored transcript and kept with the session.
+        c.stop_session();
+        let slot = c.debrief(&id);
+        assert!(wait(&slot).error.is_none());
+        assert_eq!(crate::db::s(c.db.session_detail(&id).session.as_ref().unwrap(), "summary"), "Tell me about a hard bug you fixed.");
+        let d = c.db.session_detail(&id);
+        assert!(d.answers.iter().any(|a| crate::db::s(a, "kind") == "feedback"), "the review is saved with the session");
+        assert!(crate::export::export_session(&d, false).unwrap().contains("## "));
+        assert_eq!(c.db.list_sessions("hard bug", 5).len(), 1, "history search reaches the debrief");
+    }
+
+    #[test]
+    fn cloud_requests_respect_consent_and_offline_mode() {
+        let c = core();
+        let (cfg, _) = c.upsert_provider(ProviderConfig { id: String::new(), label: "Cloud".into(), preset: "openai".into(), protocol: ProviderProtocol::Openai, base_url: "https://api.openai.com/v1".into(), has_key: false, allow_fallback: false, timeout_ms: 1000, llama: None }, None).unwrap();
+        c.update_settings(|s| {
+            s.roles.insert(ModelRole::QuickAnswer, Some(RoleTarget { provider_id: cfg.id.clone(), model: "gpt".into() }));
+        });
+        let task = || Task { system: String::new(), user: String::new(), max_tokens: 1, temperature: 0.0 };
+        let e = c.rt.block_on(c.run_task(ModelRole::QuickAnswer, task(), None, |_| {})).unwrap_err();
+        assert!(e.contains("Privacy") || e.contains("Приватність"), "{e}");
+        c.update_settings(|s| {
+            s.consent.cloud = true;
+            s.offline = true;
+        });
+        let e = c.rt.block_on(c.run_task(ModelRole::QuickAnswer, task(), None, |_| {})).unwrap_err();
+        assert!(e.to_lowercase().contains("offline") || e.contains("Офлайн"), "{e}");
+    }
+
+    #[test]
+    fn diagnostics_report_holds_no_keys() {
+        let c = core();
+        let (cfg, _) = c.upsert_provider(ProviderConfig { id: String::new(), label: "My secret employer proxy".into(), preset: "custom".into(), protocol: ProviderProtocol::Openai, base_url: "http://127.0.0.1:1/v1".into(), has_key: false, allow_fallback: false, timeout_ms: 1000, llama: None }, Some("sk-supersecret-1234567890")).unwrap();
+        assert!(cfg.has_key);
+        let path = c.data_dir.join("report.json");
+        c.export_diagnostics(&path).unwrap();
+        let report = std::fs::read_to_string(&path).unwrap();
+        assert!(!report.contains("supersecret"));
+        assert!(!report.contains("employer"), "provider names stay out of the report");
+        assert!(report.contains(env!("CARGO_PKG_VERSION")));
     }
 }

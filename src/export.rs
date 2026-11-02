@@ -14,6 +14,7 @@ pub fn kind_label(k: &str) -> &'static str {
         "points" => t("Тези", "Talking points"),
         "deep" => t("Детально", "Deep dive"),
         "screen" => t("Екран", "Screen"),
+        "feedback" => t("Розбір відповіді", "Answer review"),
         _ => "?",
     }
 }
@@ -42,9 +43,16 @@ pub fn export_session(d: &HistoryDetail, json_fmt: bool) -> Result<String, Strin
         String::new(),
         format!("{}: {}", t("Початок", "Started"), crate::i18n::fmt_datetime(i(session, "started_at"))),
         String::new(),
-        format!("## {}", t("Питання і відповіді", "Questions and answers")),
-        String::new(),
     ];
+    let summary = s(session, "summary");
+    if !summary.is_empty() {
+        lines.push(format!("## {}", t("Підсумок", "Debrief")));
+        lines.push(String::new());
+        lines.push(summary);
+        lines.push(String::new());
+    }
+    lines.push(format!("## {}", t("Питання і відповіді", "Questions and answers")));
+    lines.push(String::new());
     for q in latest_questions(&d.questions) {
         lines.push(format!("### {} — {}", ts(i(q, "start_ms")), s(q, "text")));
         lines.push(String::new());

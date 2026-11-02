@@ -2,6 +2,6 @@
 *.rs text eol=lf
 *.pdf binary
 *.docx binary
-*.onnx binary
+*.safetensors binary
 *.ico binary
 *.png binary

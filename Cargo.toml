@@ -1,8 +1,10 @@
 [package]
 name = "copilot"
-version = "0.3.0"
+version = "1.0.0"
 edition = "2021"
-description = "Local-first AI interview & meeting copilot (BYOK)"
+description = "Local-first AI interview and meeting copilot for Windows"
+repository = "https://github.com/Galactic717/copilot-rust"
+authors = ["Galactic717", "Magerko"]
 license = "MIT"
 build = "build.rs"
 
@@ -12,7 +14,6 @@ path = "src/main.rs"
 
 [dependencies]
 eframe = { version = "0.37", features = ["glow"] }
-ort = "=2.0.0-rc.15"
 rusqlite = { version = "0.41", features = ["bundled"] }
 reqwest = { version = "0.12", features = ["json", "stream", "multipart"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
@@ -45,11 +46,15 @@ features = [
     "Storage_Streams",
     "Wdk_System_SystemServices",
     "Win32_Foundation",
+    "Win32_Globalization",
     "Win32_Graphics_Gdi",
     "Win32_Security",
     "Win32_Security_Cryptography",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Com",
     "Win32_System_JobObjects",
     "Win32_System_Memory",
+    "Win32_System_Registry",
     "Win32_System_SystemInformation",
     "Win32_System_Threading",
     "Win32_System_WinRT",
@@ -66,7 +71,7 @@ lto = "thin"
 codegen-units = 4
 strip = true
 
-# Audio DSP, VAD and the ONNX gate run per 20 ms frame; debug builds would fall behind real time.
+# Audio DSP runs per 20 ms frame; debug builds would fall behind real time.
 [profile.dev.package."*"]
 opt-level = 2
 

@@ -35,10 +35,6 @@ pub fn kind_label(k: DocKind) -> &'static str {
     }
 }
 
-pub fn answer_lang_options() -> Vec<(LangPref, String)> {
-    vec![(LangPref::Auto, t("Як у питанні", "Same as the question").into()), (LangPref::Uk, "Українська".into()), (LangPref::En, "English".into())]
-}
-
 #[derive(Default)]
 pub struct ProfileState {
     draft: Option<Profile>,
@@ -112,7 +108,7 @@ pub fn show(ui: &mut egui::Ui, c: &mut Ctx, st: &mut ProfileState) {
             });
             field(&mut cols[1], t("Мова відповідей", "Answer language"), |ui| {
                 let mut v = c.s.answer_lang;
-                if combo(ui, "prof-lang", &mut v, &answer_lang_options(), ui.available_width()) {
+                if combo(ui, "prof-lang", &mut v, &super::settings_page::answer_lang_options(), ui.available_width()) {
                     core.update_settings(|s| s.answer_lang = v);
                 }
             });

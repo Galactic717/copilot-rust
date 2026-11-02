@@ -20,6 +20,7 @@ pub fn show(ui: &mut egui::Ui, c: &mut Ctx, st: &mut HomeState) {
     let snap = c.snap.clone();
     let s = c.s.clone();
     let core = c.core.clone();
+    update_banner(ui, &core, snap.session_id.is_some());
     if let (Some(n), None) = (&snap.notice, &snap.session_id) {
         banner_text(ui, Tone::Warn, n);
         ui.add_space(6.0);
@@ -36,6 +37,7 @@ pub fn show(ui: &mut egui::Ui, c: &mut Ctx, st: &mut HomeState) {
                 for (m, label) in [
                     (SessionMode::Practice, t("Тренування", "Practice")),
                     (SessionMode::Live, t("Інтерв'ю / дзвінок", "Interview / call")),
+                    (SessionMode::Mock, t("Тренувальне інтерв'ю", "Mock interview")),
                     (SessionMode::Meeting, t("Зустріч (лише транскрипт)", "Meeting (transcript only)")),
                 ] {
                     if pill(ui, label, st.mode == m, !active) {
@@ -54,7 +56,8 @@ pub fn show(ui: &mut egui::Ui, c: &mut Ctx, st: &mut HomeState) {
                         "Підказки лише на мовлення співрозмовника (системний звук). Ваш голос — у транскрипт і контекст.",
                         "Hints only for the other side's speech (system audio). Your voice goes to the transcript and context.",
                     ),
-                    SessionMode::Meeting => t("Без підказок: транскрипт зустрічі й питання зберігаються локально.", "No hints: the meeting transcript and questions are stored locally."),
+                    SessionMode::Mock => t("Застосунок ставить питання за вашим резюме й вакансією, ви відповідаєте вголос, а він розбирає відповідь.", "The app asks questions based on your CV and the job, you answer aloud, and it reviews your answer."),
+                    SessionMode::Meeting => t("Без підказок: транскрипт і підсумок зустрічі зберігаються локально.", "No hints: the meeting transcript and debrief are stored locally."),
                 },
             );
             ui.add_space(4.0);
@@ -69,6 +72,10 @@ pub fn show(ui: &mut egui::Ui, c: &mut Ctx, st: &mut HomeState) {
                 } else {
                     if primary(ui, t("Почати сесію", "Start session"), !(no_asr && no_model)) {
                         core.start_session(st.mode);
+                        if st.mode == SessionMode::Mock {
+                            core.mock_next();
+                            c.nav = Some((Page::Live, None));
+                        }
                     }
                     if let Some(r) = core.db.last_resumable() {
                         let tip = tr!("{} · {} реплік", "{} · {} lines", r.title, r.segments);
@@ -196,6 +203,33 @@ pub fn show(ui: &mut egui::Ui, c: &mut Ctx, st: &mut HomeState) {
             }
         },
     );
+}
+
+fn update_banner(ui: &mut egui::Ui, core: &std::sync::Arc<crate::core::Core>, in_session: bool) {
+    let (available, busy, download, error) = {
+        let u = core.update.lock().unwrap();
+        (u.available.clone(), u.busy, u.download.clone(), u.error.clone())
+    };
+    let Some(rel) = available else { return };
+    banner(ui, Tone::Info, |ui| {
+        ui.horizontal_wrapped(|ui| {
+            ui.label(small(tr!("Доступна нова версія: {}", "A new version is available: {}", rel.version)));
+            if !rel.page.is_empty() && ui.link(small(t("що нового", "what's new"))).clicked() {
+                crate::win::open_url(&rel.page);
+            }
+            // Never in the middle of a conversation: the update restarts the app.
+            if button(ui, if busy { t("Оновлюю…", "Updating…") } else { t("Оновити й перезапустити", "Update and restart") }, Kind::Primary, true, !busy && !in_session).clicked() {
+                core.apply_update();
+            }
+        });
+        if let Some(d) = download {
+            progress(ui, if d.total > 0 { d.received as f32 / d.total as f32 } else { 0.05 });
+        }
+        if let Some(e) = error {
+            ui.label(small(e).color(super::theme::p().err));
+        }
+    });
+    ui.add_space(6.0);
 }
 
 pub fn theme_surface2() -> egui::Color32 {

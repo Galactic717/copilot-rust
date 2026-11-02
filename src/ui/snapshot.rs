@@ -32,7 +32,10 @@ impl Snapshot {
         let dir = PathBuf::from(std::env::var_os("COPILOT_SNAPSHOT")?);
         let _ = std::fs::create_dir_all(&dir);
         let mut steps = Vec::new();
-        for (lang, tag) in [(Lang::Uk, "uk"), (Lang::En, "en")] {
+        // COPILOT_SNAPSHOT_LANGS=de,ja checks the layouts of other languages.
+        let langs = std::env::var("COPILOT_SNAPSHOT_LANGS").unwrap_or_else(|_| "uk,en".into());
+        for tag in langs.split(',') {
+            let Some(lang) = Lang::parse(tag.trim()) else { continue };
             steps.push((Step::Lang(lang), String::new()));
             for n in 0..7 {
                 steps.push((Step::Onboarding(n), format!("{tag}-onboarding-{n}")));
@@ -40,6 +43,7 @@ impl Snapshot {
             for (p, tab, name) in [
                 (Page::Home, None, "home"),
                 (Page::Live, None, "live"),
+                (Page::Live, None, "mock"),
                 (Page::History, None, "history"),
                 (Page::Profile, None, "profile"),
                 (Page::Settings, Some(Tab::Providers), "settings-providers"),
@@ -75,6 +79,7 @@ impl Snapshot {
             Step::Page(..) | Step::Overlay => {
                 core.update_settings(|s| s.onboarded = true);
                 demo(core);
+                core.session.with_snap(|s| s.mode = Some(if name.ends_with("mock") { SessionMode::Mock } else { SessionMode::Practice }));
             }
         }
         if let Some(done) = &self.pending {
@@ -116,6 +121,14 @@ impl Snapshot {
 /// A plausible live state so the session page and overlay have something to show.
 fn demo(core: &Core) {
     let en = crate::i18n::en();
+    demo_setup(core, en);
+    core.found.lock().unwrap().get_or_insert_with(|| {
+        use crate::discover::{Found, GgufModel};
+        vec![
+            Found::Server { runtime: "Ollama", base_url: "http://127.0.0.1:11434/v1".into(), models: vec!["qwen3.5:4b".into(), "gemma3:12b".into()] },
+            Found::Gguf(GgufModel { path: "Qwen3.5-4B-Q4_K_M.gguf".into(), name: "Qwen3.5-4B-Q4_K_M".into(), size: 2_740_000_000, mmproj: None, origin: "LM Studio" }),
+        ]
+    });
     core.session.with_snap(|s| {
         let q = if en { "How do database indexes speed up queries, and what do they cost?" } else { "Як індекси в базі даних прискорюють запити і яка їхня ціна?" };
         let say = if en {
@@ -129,6 +142,7 @@ fn demo(core: &Core) {
             "• B-дерево дає пошук і діапазони за O(log n)\n• Кожен INSERT/UPDATE оновлює й індекс\n• Порядок полів складеного індексу має відповідати фільтрам\n• План перевіряйте через EXPLAIN ANALYZE"
         };
         s.session_id = Some("demo".into());
+        s.mode = Some(SessionMode::Practice);
         s.listening = true;
         s.state = ConvState::AnswerReady;
         s.active_question = Some(ActiveQuestion { question_id: "q".into(), revision: 1, text: q.into(), source: Source::Remote, kind: UtteranceKind::Question, trigger: QuestionTrigger::Auto });
@@ -163,4 +177,53 @@ fn demo(core: &Core) {
         }];
         s.levels = [0.08, 0.2];
     });
+}
+
+/// A configured app: a connected model and a finished session with its debrief. Screenshot runs use their own data folder.
+fn demo_setup(core: &Core, en: bool) {
+    if core.registry.list().is_empty() {
+        let cfg = ProviderConfig { id: String::new(), label: "Ollama".into(), preset: "custom".into(), protocol: ProviderProtocol::Openai, base_url: "http://127.0.0.1:11434/v1".into(), has_key: false, allow_fallback: false, timeout_ms: 30_000, llama: None };
+        if let Ok((saved, _)) = core.upsert_provider(cfg, None) {
+            core.registry.text_ok.lock().unwrap().insert(format!("{}/qwen3.5:4b", saved.id), true);
+            core.update_settings(|s| {
+                let target = RoleTarget { provider_id: saved.id.clone(), model: "qwen3.5:4b".into() };
+                s.roles.insert(ModelRole::QuickAnswer, Some(target.clone()));
+                s.roles.insert(ModelRole::DeepAnswer, Some(target));
+                s.consent.history = true;
+                s.consent.mic = true;
+                s.consent.system = true;
+            });
+        }
+        let id = new_id();
+        let p = core.profile();
+        core.db.start_session(&id, &p.id, "live", &format!("{} · Senior Backend", crate::i18n::fmt_datetime(now_ms() - 3_600_000)));
+        let lines: [(Source, &str); 3] = if en {
+            [(Source::Remote, "How do database indexes speed up queries?"), (Source::User, "An index is a sorted structure, usually a B-tree, so the database avoids scanning the table."), (Source::Remote, "And what do they cost?")]
+        } else {
+            [(Source::Remote, "Як індекси прискорюють запити в базі даних?"), (Source::User, "Індекс — це відсортована структура, зазвичай B-дерево, тому база не сканує всю таблицю."), (Source::Remote, "А яка їхня ціна?")]
+        };
+        for (i, (source, text)) in lines.iter().enumerate() {
+            core.db.add_segment(&TranscriptSegment { session_id: id.clone(), segment_id: new_id(), source: *source, start_ms: i as i64 * 5000, end_ms: i as i64 * 5000 + 4000, text: (*text).into(), is_final: true, lang: None });
+        }
+        core.db.end_session(&id);
+        core.db.set_summary(&id, if en {
+            "## How it went\nA focused technical conversation about databases; the core answers were clear.\n\n## Gaps to close\n- Give numbers when talking about write overhead\n\n## Prepare for next time\n- Composite index ordering\n- Reading EXPLAIN ANALYZE\n- When not to index"
+        } else {
+            "## Як пройшло\nПредметна технічна розмова про бази даних, основні відповіді були чіткі.\n\n## Що підтягнути\n- Наводити цифри, коли йдеться про ціну запису\n\n## До наступного разу\n- Порядок полів у складеному індексі\n- Читання EXPLAIN ANALYZE\n- Коли індекс не потрібен"
+        });
+    }
+    core.session.with_snap(|s| {
+        s.status.mic = ComponentStatus::new(ComponentState::Ok, if en { "Headset microphone" } else { "Мікрофон гарнітури" });
+        s.status.system = ComponentStatus::new(ComponentState::Ok, "WASAPI loopback");
+        s.status.asr = ComponentStatus::new(ComponentState::Ok, format!("whisper base · {}", if en { "local" } else { "локально" }));
+        s.status.overlay = ComponentStatus::new(ComponentState::Ok, if en { "compact" } else { "компактний" });
+    });
+    *core.mock.feedback.lock().unwrap() = crate::core::Gen {
+        text: if en {
+            "## Score\n7/10: correct and clear, but with no example from your own work.\n\n## What was missing\n- The cost on writes\n- A real case from your projects".into()
+        } else {
+            "## Оцінка\n7/10: правильно й чітко, але без прикладу з власної роботи.\n\n## Чого бракувало\n- Ціни для записів\n- Реального випадку з ваших проєктів".into()
+        },
+        ..Default::default()
+    };
 }

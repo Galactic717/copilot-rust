@@ -1,8 +1,5 @@
 /target/
-node_modules/
-out/
-dist/
-release/
+/dist/
 *.db
 *.db-*
 .env*

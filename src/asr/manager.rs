@@ -7,7 +7,7 @@ use serde_json::json;
 use tokio::sync::Notify;
 
 use super::assets::{model_label, AsrAssets};
-use super::silero::SileroGate;
+use super::silero;
 use super::whisper::{apply_vocabulary, is_hallucination, strip_tags, transcribe, WhisperSidecar};
 use crate::i18n::t;
 use crate::net::Net;
@@ -60,7 +60,6 @@ pub struct AsrManager {
     running: AtomicBool,
     restarts: AtomicU32,
     ev: Arc<dyn AsrEvents>,
-    silero: SileroGate,
     rt: tokio::runtime::Handle,
 }
 
@@ -79,7 +78,6 @@ impl AsrManager {
             running: AtomicBool::new(false),
             restarts: AtomicU32::new(0),
             ev,
-            silero: SileroGate::default(),
             rt: rt.clone(),
         });
         me.refresh_status();
@@ -237,14 +235,13 @@ impl AsrManager {
                 continue;
             }
             // Silero speech gate: drop music/noise/silence before whisper so it can't hallucinate on them.
-            if let Some(speech) = self.silero.speech_seconds(&job.pcm, 0.5) {
-                if speech < MIN_SPEECH_S {
-                    if job.is_final {
-                        crate::db::diag("asr_nonspeech", json!({ "audioMs": job.pcm.len() / 16, "speechMs": (speech * 1000.0) as u64 }));
-                        self.emit(&job, String::new(), None);
-                    }
-                    continue;
+            let speech = silero::speech_seconds(&job.pcm, 0.5);
+            if speech < MIN_SPEECH_S {
+                if job.is_final {
+                    crate::db::diag("asr_nonspeech", json!({ "audioMs": job.pcm.len() / 16, "speechMs": (speech * 1000.0) as u64 }));
+                    self.emit(&job, String::new(), None);
                 }
+                continue;
             }
             let cfg = self.config();
             let endpoint = self.sidecar.lock().unwrap().as_ref().map(|s| s.endpoint());

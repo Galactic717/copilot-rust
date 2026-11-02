@@ -86,7 +86,7 @@ pub fn run(core: Arc<Core>) -> eframe::Result<()> {
     let icon = egui::IconData { rgba: crate::icon::app_icon(64), width: 64, height: 64 };
     let opts = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_visible(std::env::var_os("COPILOT_SNAPSHOT").is_none())
+            .with_visible(std::env::var_os("COPILOT_SNAPSHOT").is_none() && !std::env::args().any(|a| a == win::TRAY_ARG))
             .with_title(win::TITLE_MAIN)
             .with_inner_size([1180.0, 780.0])
             .with_min_inner_size([880.0, 600.0])
@@ -119,13 +119,13 @@ pub struct App {
     settings: settings_page::SettingsState,
     onboarding: onboarding::OnboardingState,
     snapshot: Option<snapshot::Snapshot>,
+    fonts_for: Option<(Lang, LangPref, LangPref)>,
 }
 
 impl App {
     fn new(cc: &eframe::CreationContext<'_>, core: Arc<Core>) -> Self {
         let ctx = cc.egui_ctx.clone();
         let _ = core.ui.ctx.set(ctx.clone());
-        theme::install_fonts(&ctx);
         theme::apply(&ctx, core.s().overlay.theme);
 
         let (tx, events) = channel::<AppEvent>();
@@ -184,7 +184,7 @@ impl App {
             events,
             tray,
             tray_items,
-            tray_key: (true, true, Lang::En),
+            tray_key: (true, true, Lang::EN),
             hotkeys: GlobalHotKeyManager::new().ok(),
             registered: Vec::new(),
             overlay_ui: Arc::new(Mutex::new(overlay::OverlayUi::default())),
@@ -200,6 +200,7 @@ impl App {
             settings: Default::default(),
             onboarding: Default::default(),
             snapshot: snapshot::Snapshot::from_env(),
+            fonts_for: None,
         };
         app.refresh_tray(true);
         app
@@ -221,9 +222,9 @@ impl App {
             match HotKey::from_str(accel) {
                 Ok(hk) => match m.register(hk) {
                     Ok(()) => self.registered.push((hk, a)),
-                    Err(_) => conflicts.push(crate::tr!("{} ({:?}) зайнято іншою програмою", "{} ({:?}) is taken by another app", pretty_accel(accel), a)),
+                    Err(_) => conflicts.push(crate::tr!("{} ({}) зайнято іншою програмою", "{} ({}) is taken by another app", pretty_accel(accel), settings_page::action_label(a))),
                 },
-                Err(_) => conflicts.push(crate::tr!("{} ({:?}) — некоректне поєднання", "{} ({:?}) — invalid shortcut", pretty_accel(accel), a)),
+                Err(_) => conflicts.push(crate::tr!("{} ({}) — некоректне поєднання", "{} ({}) — invalid shortcut", pretty_accel(accel), settings_page::action_label(a))),
             }
         }
         if !conflicts.is_empty() {
@@ -292,6 +293,16 @@ impl App {
                     _ => {}
                 },
             }
+        }
+    }
+
+    /// Reloads fonts when a language with another script is picked: the CJK ones are too big to always keep in memory.
+    fn sync_fonts(&mut self, ctx: &egui::Context) {
+        let s = self.core.s();
+        let key = (s.ui_lang, s.asr.language, s.answer_lang);
+        if self.fonts_for != Some(key) {
+            self.fonts_for = Some(key);
+            theme::install_fonts(ctx, &[s.ui_lang.code(), s.asr.language.code(), s.answer_lang.code()]);
         }
     }
 
@@ -403,6 +414,7 @@ impl eframe::App for App {
             sn.tick(ctx, &self.core);
         }
         self.handle_events(ctx);
+        self.sync_fonts(ctx);
         if self.core.ui.shortcuts_dirty.swap(false, std::sync::atomic::Ordering::SeqCst) {
             self.register_hotkeys();
         }

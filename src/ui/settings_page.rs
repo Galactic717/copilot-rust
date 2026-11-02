@@ -20,6 +20,10 @@ pub struct SettingsState {
     diag: Option<Promise<Vec<DiagCheck>>>,
     report: Option<Vec<DiagCheck>>,
     privacy_msg: Option<String>,
+    autostart: Option<bool>,
+    shortcut_msg: Option<String>,
+    export: Option<Promise<Option<Result<(), String>>>>,
+    export_msg: Option<String>,
 }
 
 pub fn show(ui: &mut egui::Ui, c: &mut Ctx, st: &mut SettingsState, tab: &mut Tab) {
@@ -43,7 +47,7 @@ pub fn show(ui: &mut egui::Ui, c: &mut Ctx, st: &mut SettingsState, tab: &mut Ta
     match tab {
         Tab::Providers => providers::show(ui, c, &mut st.providers),
         Tab::Audio => audio_tab(ui, c, &mut st.audio),
-        Tab::Overlay => overlay_tab(ui, c),
+        Tab::Overlay => overlay_tab(ui, c, st),
         Tab::Shortcuts => shortcuts_tab(ui, c, st),
         Tab::Privacy => privacy_tab(ui, c, st),
         Tab::Usage => usage_tab(ui, c),
@@ -52,15 +56,23 @@ pub fn show(ui: &mut egui::Ui, c: &mut Ctx, st: &mut SettingsState, tab: &mut Ta
 }
 
 pub fn ui_lang_options() -> Vec<(Lang, String)> {
-    vec![(Lang::Uk, "Українська".into()), (Lang::En, "English".into())]
+    LANGS.iter().filter(|l| l.ui).filter_map(|l| Some((Lang::parse(l.code)?, l.native.to_string()))).collect()
+}
+
+fn lang_prefs() -> impl Iterator<Item = (LangPref, String)> {
+    LANGS.iter().filter_map(|l| Some((LangPref::Is(Lang::parse(l.code)?), l.native.to_string())))
 }
 
 // A fixed language is ~1.5× faster on CPU and never turns speech into a translation.
 pub fn asr_lang_options() -> Vec<(LangPref, String)> {
-    vec![(LangPref::Uk, "Українська".into()), (LangPref::En, "English".into()), (LangPref::Auto, t("Змішана — автовизначення (повільніше)", "Mixed — auto-detect (slower)").into())]
+    std::iter::once((LangPref::Auto, t("Змішана — автовизначення (повільніше)", "Mixed — auto-detect (slower)").to_string())).chain(lang_prefs()).collect()
 }
 
-fn overlay_tab(ui: &mut egui::Ui, c: &mut Ctx) {
+pub fn answer_lang_options() -> Vec<(LangPref, String)> {
+    std::iter::once((LangPref::Auto, t("Як у питанні", "Same as the question").to_string())).chain(lang_prefs()).collect()
+}
+
+fn overlay_tab(ui: &mut egui::Ui, c: &mut Ctx, st: &mut SettingsState) {
     let core = c.core.clone();
     let s = c.s.clone();
     let o = s.overlay.clone();
@@ -117,6 +129,30 @@ fn overlay_tab(ui: &mut egui::Ui, c: &mut Ctx) {
                 )),
             ) {
                 core.update_settings(|s| s.auto_answer = auto);
+            }
+            let mut tq = s.translate_questions;
+            if toggle(
+                ui,
+                &mut tq,
+                t("Перекладати питання мовою інтерфейсу", "Translate questions into the interface language"),
+                Some(t(
+                    "Для співбесід не рідною мовою: переклад з'являється під питанням. Кожне питання іншою мовою — окремий невеликий запит до вашої моделі.",
+                    "For interviews in a foreign language: the translation appears under the question. Each question in another language is one small extra request to your model.",
+                )),
+            ) {
+                core.update_settings(|s| s.translate_questions = tq);
+            }
+            let mut ad = s.auto_debrief;
+            if toggle(
+                ui,
+                &mut ad,
+                t("Писати підсумок після завершення сесії", "Write a debrief when a session ends"),
+                Some(t(
+                    "Автоматично лише з локальною моделлю. З хмарною — кнопка в «Історії»: підсумок отримує весь транскрипт.",
+                    "Automatic only with a local model. With a cloud one it is a button in “History”: a debrief gets the whole transcript.",
+                )),
+            ) {
+                core.update_settings(|s| s.auto_debrief = ad);
             }
             note(
                 ui,
@@ -193,10 +229,52 @@ fn overlay_tab(ui: &mut egui::Ui, c: &mut Ctx) {
         ) {
             core.update_settings(|s| s.window.panic_quits = pq);
         }
+        let mut on = *st.autostart.get_or_insert_with(crate::win::autostart_enabled);
+        if toggle(ui, &mut on, t("Запускати разом з Windows (у треї)", "Start with Windows (in the tray)"), None) {
+            st.shortcut_msg = crate::win::set_autostart(on).err();
+            st.autostart = None;
+        }
+        ui.horizontal_wrapped(|ui| {
+            let exists = crate::win::start_menu_shortcut_exists();
+            if btn_sm(ui, if exists { t("Оновити ярлик у меню «Пуск»", "Update the Start menu shortcut") } else { t("Додати в меню «Пуск»", "Add to the Start menu") }) {
+                st.shortcut_msg = Some(match crate::win::create_start_menu_shortcut() {
+                    Ok(()) => t("Ярлик створено. Він веде до цього файлу, тож спершу покладіть Copilot.exe туди, де він лишатиметься.", "Shortcut created. It points at this file, so first put Copilot.exe where it will stay.").into(),
+                    Err(e) => e,
+                });
+            }
+            if let Some(m) = &st.shortcut_msg {
+                ui.label(small(m));
+            }
+        });
+    });
+    ui.add_space(10.0);
+    update_section(ui, c);
+}
+
+fn update_section(ui: &mut egui::Ui, c: &mut Ctx) {
+    let core = c.core.clone();
+    let s = c.s.clone();
+    section(ui, t("Оновлення", "Updates"), |_| {}, |ui| {
+        let mut on = s.check_updates;
+        if toggle(
+            ui,
+            &mut on,
+            t("Перевіряти оновлення під час запуску", "Check for updates on start"),
+            Some(t("Один запит до GitHub без жодних ваших даних. Встановлення — лише після вашого натискання.", "One request to GitHub with none of your data. Nothing installs until you click.")),
+        ) {
+            core.update_settings(|s| s.check_updates = on);
+        }
+        ui.horizontal_wrapped(|ui| {
+            ui.label(faint(tr!("Версія {}", "Version {}", env!("CARGO_PKG_VERSION"))));
+            if btn_sm(ui, t("Перевірити зараз", "Check now")) {
+                core.update_settings(|s| s.check_updates = true);
+                core.check_update();
+            }
+        });
     });
 }
 
-fn action_label(a: ShortcutAction) -> &'static str {
+pub fn action_label(a: ShortcutAction) -> &'static str {
     match a {
         ShortcutAction::ToggleOverlay => t("Показати / сховати підказки", "Show / hide hints"),
         ShortcutAction::ToggleListen => t("Пауза / продовжити (або почати сесію)", "Pause / resume (or start a session)"),
@@ -308,7 +386,7 @@ fn privacy_tab(ui: &mut egui::Ui, c: &mut Ctx, st: &mut SettingsState) {
                 |c| &mut c.cloud,
                 cs.cloud,
                 t("Надсилання тексту хмарним провайдерам", "Sending text to cloud providers"),
-                Some(t("Потрібно для OpenAI / Anthropic / Gemini / OpenRouter та інших хмарних сервісів. Для llama.cpp не потрібно.", "Needed for OpenAI / Anthropic / Gemini / OpenRouter and other cloud services. Not needed for llama.cpp.")),
+                Some(t("Потрібно для OpenAI / Anthropic / Gemini / OpenRouter та інших хмарних сервісів. Для локальних моделей не потрібно.", "Needed for OpenAI / Anthropic / Gemini / OpenRouter and other cloud services. Not needed for local models.")),
             ),
             (|c| &mut c.history, cs.history, t("Зберігати історію сесій на цьому комп'ютері", "Keep session history on this computer"), None),
         ];
@@ -321,7 +399,7 @@ fn privacy_tab(ui: &mut egui::Ui, c: &mut Ctx, st: &mut SettingsState) {
                 });
             }
         }
-        note(ui, t("Телеметрії немає: застосунок нічого не надсилає своїм розробникам.", "No telemetry: the app sends nothing to its developers."));
+        note(ui, t("Телеметрії немає: застосунок нічого не надсилає своїм розробникам. Єдиний запит за власною ініціативою — перевірка оновлень на GitHub, її можна вимкнути у «Підказки».", "No telemetry: the app sends nothing to its developers. The only request it makes on its own is the update check on GitHub, which can be turned off under “Hints”."));
     });
     ui.add_space(10.0);
     section(ui, t("Офлайн-режим", "Offline mode"), |_| {}, |ui| {
@@ -330,7 +408,7 @@ fn privacy_tab(ui: &mut egui::Ui, c: &mut Ctx, st: &mut SettingsState) {
             ui,
             &mut off,
             t("Працювати без інтернету", "Work without internet"),
-            Some(t("Блокує всі зовнішні адреси на рівні застосунку. Працюють лише локальні моделі (llama.cpp) і локальне розпізнавання.", "Blocks all external addresses in the app. Only local models (llama.cpp) and local recognition work.")),
+            Some(t("Блокує всі зовнішні адреси на рівні застосунку. Працюють лише локальні моделі й локальне розпізнавання.", "Blocks all external addresses in the app. Only local models and local recognition work.")),
         ) {
             core.update_settings(|s| s.offline = off);
         }
@@ -503,7 +581,22 @@ fn diagnostics_tab(ui: &mut egui::Ui, c: &mut Ctx, st: &mut SettingsState) {
         },
     );
     ui.add_space(10.0);
-    section(ui, t("Журнал (без ключів і текстів розмов)", "Log (no keys and no conversation text)"), |_| {}, |ui| {
+    if let Some(r) = st.export.as_ref().and_then(|p| p.take()) {
+        st.export = None;
+        st.export_msg = r.map(|x| x.err().unwrap_or_else(|| t("Звіт збережено. Перед надсиланням можете його переглянути: це звичайний текст.", "Report saved. You can read it before sending: it is plain text.").into()));
+    }
+    section(ui, t("Журнал (без ключів і текстів розмов)", "Log (no keys and no conversation text)"), |ui| {
+        if btn_sm(ui, t("Зберегти звіт для підтримки", "Save a report for support")) && st.export.is_none() {
+            let c2 = core.clone();
+            st.export = Some(Promise::thread(&core, move || {
+                let path = rfd::FileDialog::new().set_file_name("copilot-diagnostics.json").add_filter("JSON", &["json"]).save_file()?;
+                Some(c2.export_diagnostics(&path))
+            }));
+        }
+    }, |ui| {
+        if let Some(m) = &st.export_msg {
+            ui.label(small(m));
+        }
         egui::ScrollArea::vertical().id_salt("diag-log").max_height(280.0).auto_shrink([false, true]).show(ui, |ui| {
             let log = core.db.recent_diag(100);
             if log.is_empty() {

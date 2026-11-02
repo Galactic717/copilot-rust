@@ -30,7 +30,8 @@ pub fn model_label(name: &str) -> String {
     }
 }
 
-const RELEASE: &str = "b5454";
+pub const RELEASE: &str = "b5454";
+pub const CPU_BINARY_SHA256: &str = "6ba69e3482d7826214f90a6a9c84ca07782aec1e1d0c6a7c30c994fd5d816ccb";
 
 struct Binary {
     url: String,
@@ -42,7 +43,7 @@ fn binary(b: AsrBackend) -> Binary {
     match b {
         AsrBackend::Cpu => Binary {
             url: format!("https://github.com/ggml-org/whisper.cpp/releases/download/{RELEASE}/whisper-bin-x64.zip"),
-            sha256: "6ba69e3482d7826214f90a6a9c84ca07782aec1e1d0c6a7c30c994fd5d816ccb",
+            sha256: CPU_BINARY_SHA256,
         },
         AsrBackend::Cuda => Binary {
             url: format!("https://github.com/ggml-org/whisper.cpp/releases/download/{RELEASE}/whisper-bin-win-cuda-12.4.0-x64.zip"),
@@ -107,7 +108,7 @@ impl AsrAssets {
     }
 }
 
-fn unzip(zip_path: &Path, dir: &Path) -> Result<(), String> {
+pub fn unzip(zip_path: &Path, dir: &Path) -> Result<(), String> {
     let f = std::fs::File::open(zip_path).map_err(|e| e.to_string())?;
     let mut z = zip::ZipArchive::new(f).map_err(|e| e.to_string())?;
     for i in 0..z.len() {
@@ -128,26 +129,50 @@ fn unzip(zip_path: &Path, dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
-async fn download(net: &Net, url: &str, dest: &Path, name: &str, progress: &(dyn Fn(Download) + Send + Sync)) -> Result<String, String> {
-    let res = net.get(url).map_err(|e| e.line())?.send().await.map_err(|e| crate::net::transport_error(&e).line())?;
-    if !res.status().is_success() {
-        return Err(crate::tr!("Завантаження не вдалося: HTTP {}", "Download failed: HTTP {}", res.status().as_u16()));
-    }
-    let total = res.content_length().unwrap_or(0);
-    let mut file = tokio::fs::File::create(dest).await.map_err(|e| e.to_string())?;
+/// Streams to `dest` and returns the SHA-256. A `.part` left by a dropped connection is continued, not restarted: the
+/// local models weigh gigabytes. The digest covers the whole file either way, so a bad resume fails the caller's check.
+pub async fn download(net: &Net, url: &str, dest: &Path, name: &str, progress: &(dyn Fn(Download) + Send + Sync)) -> Result<String, String> {
     let mut hash = Sha256::new();
-    let mut received = 0u64;
+    let mut have = 0u64;
+    if let Ok(mut f) = std::fs::File::open(dest) {
+        use std::io::Read;
+        let mut buf = vec![0u8; 1 << 20];
+        while let Ok(n) = f.read(&mut buf) {
+            if n == 0 {
+                break;
+            }
+            hash.update(&buf[..n]);
+            have += n as u64;
+        }
+    }
+    let mut rb = net.get(url).map_err(|e| e.line())?;
+    if have > 0 {
+        rb = rb.header("Range", format!("bytes={have}-"));
+    }
+    let res = rb.send().await.map_err(|e| crate::net::transport_error(&e).line())?;
+    let status = res.status().as_u16();
+    if status == 416 {
+        // The part is already complete.
+        progress(Download { name: name.into(), received: have, total: have });
+        return Ok(hash.finalize().iter().map(|b| format!("{b:02x}")).collect());
+    }
+    if !res.status().is_success() {
+        return Err(crate::tr!("Завантаження не вдалося: HTTP {}", "Download failed: HTTP {}", status));
+    }
+    let resumed = have > 0 && status == 206;
+    if !resumed {
+        // The server ignored the range (or there was nothing to resume): start over.
+        hash = Sha256::new();
+        have = 0;
+    }
+    let total = res.content_length().unwrap_or(0) + have;
+    let mut file = if resumed { tokio::fs::OpenOptions::new().append(true).open(dest).await } else { tokio::fs::File::create(dest).await }.map_err(|e| e.to_string())?;
+    let mut received = have;
     let mut last = std::time::Instant::now();
     let mut body = res.bytes_stream();
     while let Some(chunk) = body.next().await {
-        let chunk = match chunk {
-            Ok(c) => c,
-            Err(e) => {
-                drop(file);
-                let _ = std::fs::remove_file(dest);
-                return Err(crate::net::transport_error(&e).line());
-            }
-        };
+        // The part stays on disk: the next attempt continues from here.
+        let chunk = chunk.map_err(|e| crate::net::transport_error(&e).line())?;
         hash.update(&chunk);
         received += chunk.len() as u64;
         file.write_all(&chunk).await.map_err(|e| e.to_string())?;
