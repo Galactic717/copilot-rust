@@ -5,9 +5,11 @@
 use std::collections::HashSet;
 use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 use std::time::Duration;
 
 use serde_json::Value;
+use regex::Regex;
 
 use crate::net::Net;
 
@@ -54,6 +56,77 @@ pub enum Found {
     Gguf(GgufModel),
 }
 
+#[derive(Clone, Debug)]
+pub struct BatchProfile {
+    pub path: PathBuf,
+    pub port: u16,
+    pub alias: Option<String>,
+    pub vision: bool,
+}
+
+impl BatchProfile {
+    pub fn name(&self) -> String {
+        self.path.file_stem().unwrap_or_default().to_string_lossy().into_owned()
+    }
+
+    pub fn base_url(&self) -> String {
+        format!("http://127.0.0.1:{}/v1", self.port)
+    }
+}
+
+fn launcher_text(path: &Path) -> Option<String> {
+    let mut text = String::new();
+    std::fs::File::open(path).ok()?.take(64 * 1024).read_to_string(&mut text).ok()?;
+    Some(text)
+}
+
+pub fn batch_profile(path: PathBuf) -> Option<BatchProfile> {
+    static PORT: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"(?i)(?:^|\s)--port[= \t]+"?(\d{1,5})\b"#).unwrap());
+    static ALIAS: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"(?i)(?:^|\s)--alias[ \t=]+(?:"([^"\r\n]+)"|([^\s^'"]+))|['"]--alias['"]\s*,\s*['"]([\w./:-]+)['"]"#).unwrap());
+    static WRAPPER: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"(?i)-file[ \t]+"%~dp0([^"\\/:]+\.ps1)"[ \t]+-mode[ \t]+(CPU|GPU)\b"#).unwrap());
+    static MODE_PORTS: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"(?im)^\s*\$port\s*=\s*if\s*\(\s*\$Mode\s+-eq\s+['"]CPU['"]\s*\)\s*\{\s*(\d{1,5})\s*\}\s*else\s*\{\s*(\d{1,5})\s*\}"#).unwrap());
+    if !is_batch(&path) {
+        return None;
+    }
+    let script = launcher_text(&path)?;
+    let script = script.lines().filter(|line| {
+        let line = line.trim_start().trim_start_matches(['\u{feff}', '@']);
+        !line.starts_with("::") && !line.get(..4).is_some_and(|s| s.eq_ignore_ascii_case("rem "))
+    }).collect::<Vec<_>>().join("\n");
+    let (port, args) = if let Some(m) = PORT.captures(&script) {
+        (m[1].parse::<u16>().ok()?, script)
+    } else {
+        // A batch launcher can select a CPU/GPU profile in a neighboring PowerShell script.
+        let wrapper = WRAPPER.captures(&script)?;
+        let args = launcher_text(&path.with_file_name(&wrapper[1]))?;
+        let mode = if wrapper[2].eq_ignore_ascii_case("CPU") { 1 } else { 2 };
+        let port = MODE_PORTS.captures(args.trim_start_matches('\u{feff}'))?[mode].parse().ok()?;
+        (port, args)
+    };
+    if port == 0 {
+        return None;
+    }
+    Some(BatchProfile {
+        path,
+        port,
+        alias: ALIAS.captures(&args).and_then(|m| {
+            m.iter().skip(1).flatten().next().map(|value| value.as_str()).filter(|value| !value.contains(['%', '!'])).map(String::from)
+        }),
+        vision: args.to_ascii_lowercase().contains("--mmproj"),
+    })
+}
+
+pub fn batch_profiles(dir: &Path) -> Vec<BatchProfile> {
+    let Ok(entries) = std::fs::read_dir(dir) else { return Vec::new() };
+    let mut profiles: Vec<_> = entries.flatten().filter_map(|entry| batch_profile(entry.path())).collect();
+    profiles.sort_by(|a, b| a.path.cmp(&b.path));
+    profiles
+}
+
+pub fn is_batch(path: &Path) -> bool {
+    path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("bat") || ext.eq_ignore_ascii_case("cmd"))
+}
+
 /// The folders to look in. A struct so tests can point it at a temp dir instead of the real home.
 #[derive(Clone)]
 pub struct Places {
@@ -79,6 +152,10 @@ impl Places {
             ollama_models: var("OLLAMA_MODELS"),
             data_dir: data_dir.to_path_buf(),
         }
+    }
+
+    pub fn batch_dir(&self) -> PathBuf {
+        self.local_app_data.join("Programs").join("llama.cpp")
     }
 
     fn gguf_roots(&self) -> Vec<(PathBuf, &'static str)> {
@@ -448,6 +525,23 @@ mod tests {
         let d = std::env::temp_dir().join(format!("copilot-disc-{}", crate::types::new_id()));
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    #[test]
+    fn discovers_batch_profiles_with_literal_ports_and_powershell_modes() {
+        let d = tmp();
+        let direct = d.join("Start Gemma.bat");
+        std::fs::write(&direct, "@echo off\r\n\"%SERVER%\" --model \"%MODEL%\" ^\r\n  --port 9934 --alias \"gemma local\" --mmproj \"%MMPROJ%\"\r\n").unwrap();
+        std::fs::write(d.join("Start GLM.CMD"), "@echo off\r\n\"%SERVER%\" --port 9934 --alias glm --no-mmproj\r\n").unwrap();
+        std::fs::write(d.join("Model Launcher.ps1"), "\u{feff}$port = if ($Mode -eq 'CPU') { 9941 } else { 9942 }\n$args = @('--port', \"$port\", '--alias', 'deepseek-v4-maxq')\n").unwrap();
+        for mode in ["CPU", "GPU"] {
+            std::fs::write(d.join(format!("Start DeepSeek {mode}.bat")), format!("powershell.exe -File \"%~dp0Model Launcher.ps1\" -Mode {mode} %PAUSE_OPTION%\n")).unwrap();
+        }
+        std::fs::write(d.join("Maintenance.bat"), "@echo off\nrem not a model launcher\n").unwrap();
+        let rows = batch_profiles(&d);
+        let endpoints: Vec<_> = rows.iter().map(|p| (p.port, p.alias.as_deref(), p.vision)).collect();
+        assert_eq!(endpoints, [(9941, Some("deepseek-v4-maxq"), false), (9942, Some("deepseek-v4-maxq"), false), (9934, Some("glm"), false), (9934, Some("gemma local"), true)]);
+        let _ = std::fs::remove_dir_all(d);
     }
 
     fn places(root: &Path) -> Places {

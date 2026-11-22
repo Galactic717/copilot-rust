@@ -91,6 +91,12 @@ pub struct MockState {
     pub feedback: GenSlot,
 }
 
+#[derive(Default)]
+pub struct ImportReport {
+    pub added: usize,
+    pub failures: Vec<String>,
+}
+
 pub struct Core {
     pub data_dir: PathBuf,
     pub rt: tokio::runtime::Runtime,
@@ -110,6 +116,7 @@ pub struct Core {
     pub ui: UiBridge,
     /// Local models found on this machine; None until the first scan finishes.
     pub found: Mutex<Option<Vec<Found>>>,
+    pub batch_profiles: Mutex<Vec<discover::BatchProfile>>,
     pub scanning: AtomicBool,
     pub local_install: Mutex<LocalInstall>,
     pub update: Mutex<UpdateState>,
@@ -283,6 +290,7 @@ impl Core {
                 shortcut_conflicts: Mutex::new(Vec::new()),
                 ui: UiBridge::default(),
                 found: Mutex::new(None),
+                batch_profiles: Mutex::new(Vec::new()),
                 scanning: AtomicBool::new(false),
                 local_install: Mutex::new(LocalInstall::default()),
                 update: Mutex::new(UpdateState::default()),
@@ -342,9 +350,15 @@ impl Core {
         }
         let core = self.arc();
         self.rt.spawn(async move {
-            let found = discover::scan(&core.net, &core.places(), win::total_ram()).await;
+            let places = core.places();
+            let batch_dir = places.batch_dir();
+            let (found, batches) = tokio::join!(
+                discover::scan(&core.net, &places, win::total_ram()),
+                tokio::task::spawn_blocking(move || discover::batch_profiles(&batch_dir)),
+            );
             crate::db::diag("local_scan", json!({ "found": found.len() }));
             *core.found.lock().unwrap() = Some(found);
+            *core.batch_profiles.lock().unwrap() = batches.unwrap_or_default();
             core.scanning.store(false, Ordering::SeqCst);
             core.emit();
         });
@@ -359,6 +373,47 @@ impl Core {
                 s.roles.insert(ModelRole::Vision, Some(target.clone()));
             }
         });
+    }
+
+    pub fn batch_provider(&self, path: &Path) -> Option<ProviderConfig> {
+        self.registry.list().into_iter().find(|p| p.llama.as_ref().is_some_and(|l| Path::new(&l.server_path) == path))
+    }
+
+    pub async fn use_batch(&self, profile: &discover::BatchProfile) -> Result<(), String> {
+        let cfg = match self.batch_provider(&profile.path) {
+            Some(cfg) => {
+                let port = reqwest::Url::parse(&cfg.base_url).ok().and_then(|url| url.port_or_known_default());
+                if port != Some(profile.port) {
+                    return Err(t("Адреса API має відповідати порту скрипта запуску.", "The API address must match the launch script's port.").into());
+                }
+                cfg
+            }
+            None => self.upsert_provider(ProviderConfig {
+                id: String::new(),
+                label: profile.name(),
+                preset: "llamacpp".into(),
+                protocol: ProviderProtocol::Openai,
+                base_url: profile.base_url(),
+                has_key: false,
+                allow_fallback: false,
+                timeout_ms: 120_000,
+                llama: Some(LlamaLaunch { server_path: profile.path.display().to_string(), ..Default::default() }),
+            }, None)?.0,
+        };
+        self.emit();
+        self.llama.ensure(&cfg, &self.net).await?;
+        let owned = self.llama.state(&cfg.id) == LlamaState::Running;
+        let models = self.registry.models(&cfg.id, true).await.map_err(|e| e.line())?;
+        if owned && self.llama.state(&cfg.id) != LlamaState::Running {
+            return Err(t("Запуск зупинено", "Launch stopped").into());
+        }
+        let chosen = match &profile.alias {
+            Some(alias) => models.iter().find(|model| model.id == *alias),
+            None => models.first(),
+        }.ok_or_else(|| t("API не повернув очікувану модель. Перевірте, який сервер працює на цьому порту.", "The API did not return the expected model. Check which server is running on this port.").to_string())?;
+        self.set_answer_roles(&cfg.id, &chosen.id, chosen.vision.unwrap_or(profile.vision));
+        self.emit();
+        Ok(())
     }
 
     /// Connects a found model in one step: an existing provider for the same server or file is reused, not duplicated.
@@ -389,7 +444,7 @@ impl Core {
             }),
             Found::Gguf(m) => {
                 let path = m.path.display().to_string();
-                match existing.iter().find(|p| p.llama.as_ref().is_some_and(|l| l.model_path == path)) {
+                match existing.iter().find(|p| p.llama.as_ref().is_some_and(|l| l.model_path == path && !discover::is_batch(Path::new(&l.server_path)))) {
                     Some(p) => p.clone(),
                     None => {
                         let server = self.llama_server().await?;
@@ -416,7 +471,7 @@ impl Core {
                 }
             }
         };
-        let (saved, _) = self.upsert_provider(cfg, None)?;
+        let saved = if cfg.id.is_empty() { self.upsert_provider(cfg, None)?.0 } else { cfg };
         let (model, vision) = match f {
             Found::Server { models, .. } | Found::Stopped { models, .. } => (model.or_else(|| models.first().cloned()).unwrap_or_default(), true),
             // llama-server serves the one model it was started with, whatever name the request carries.
@@ -740,7 +795,10 @@ impl Core {
     }
 
     pub fn update_settings(&self, f: impl FnOnce(&mut Settings)) {
-        let (prev, _) = self.settings.update(f);
+        let (prev, current) = self.settings.update(f);
+        if prev.active_profile_id != current.active_profile_id {
+            self.session.reload_knowledge();
+        }
         self.apply_settings(Some(&prev));
     }
 
@@ -1159,8 +1217,8 @@ impl Core {
             items: vec![
                 t("Аудіо не покидає комп'ютер — розпізнається локально (whisper.cpp)", "Audio never leaves the computer — recognized locally (whisper.cpp)").into(),
                 t(
-                    "Провайдеру відповідей іде: текст поточного питання, останні хвилини транскрипту, доречні фрагменти CV/JD і нотатки профілю",
-                    "The answer provider receives: the current question, the last minutes of transcript, relevant CV/JD fragments and profile notes",
+                    "Провайдер відповідей отримує поточне питання, недавній транскрипт і доречні матеріали профілю.",
+                    "The answer provider receives the current question, recent transcript and relevant profile materials.",
                 )
                 .into(),
                 t("Підсумок сесії отримує весь транскрипт: автоматично лише локальна модель, хмарна — за вашою кнопкою в «Історії»", "A session debrief gets the whole transcript: automatically only a local model, a cloud one on your click in “History”").into(),
@@ -1181,6 +1239,9 @@ impl Core {
         let check = check_endpoint(&cfg.base_url);
         if !check.ok {
             return Err(check.error.unwrap_or_default());
+        }
+        if cfg.llama.as_ref().is_some_and(|l| discover::is_batch(Path::new(&l.server_path))) && !crate::net::is_loopback_url(&cfg.base_url) {
+            return Err(t("Для скрипта запуску потрібна локальна адреса API", "A launch script requires a local API address").into());
         }
         if cfg.id.is_empty() {
             cfg.id = new_id()[..8].to_string();
@@ -1234,29 +1295,44 @@ impl Core {
         if self.db.list_profiles().len() <= 1 {
             return Err(t("Не можна видалити останній профіль", "You cannot delete the last profile").into());
         }
-        self.db.delete_profile(id);
+        self.db.delete_profile(id).map_err(|e| e.to_string())?;
         if self.s().active_profile_id == id {
             let first = self.db.list_profiles()[0].id.clone();
             self.update_settings(|s| s.active_profile_id = first);
+        } else {
+            self.session.reload_knowledge();
         }
+        Ok(())
+    }
+
+    pub fn import_docs(&self, profile_id: &str, paths: &[PathBuf]) -> ImportReport {
+        let mut report = ImportReport::default();
+        for path in paths {
+            let name = path.file_name().unwrap_or(path.as_os_str()).to_string_lossy();
+            let result = crate::context::importers::extract_text(path).and_then(|text| self.store_profile_text(profile_id, &name, &text));
+            match result {
+                Ok(()) => report.added += 1,
+                Err(error) => report.failures.push(format!("{name} — {error}")),
+            }
+        }
+        if report.added != 0 {
+            self.session.reload_knowledge();
+        }
+        report
+    }
+
+    pub fn add_profile_text(&self, profile_id: &str, name: &str, text: &str) -> Result<(), String> {
+        self.store_profile_text(profile_id, name, text)?;
         self.session.reload_knowledge();
         Ok(())
     }
 
-    pub fn import_doc(&self, profile_id: &str, kind: DocKind, path: &Path) -> Result<(), String> {
-        let text = crate::context::importers::extract_text(path)?;
-        if text.trim().is_empty() {
+    fn store_profile_text(&self, profile_id: &str, name: &str, text: &str) -> Result<(), String> {
+        let pieces = crate::context::retrieval::chunk_text(text, 700);
+        if pieces.is_empty() {
             return Err(t("У документі не знайдено тексту (можливо, це скан — потрібен OCR)", "No text found in the document (it may be a scan — OCR needed)").into());
         }
-        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-        self.add_text(profile_id, kind, &name, &text);
-        Ok(())
-    }
-
-    pub fn add_text(&self, profile_id: &str, kind: DocKind, name: &str, text: &str) {
-        let pieces = crate::context::retrieval::chunk_text(text, 700);
-        self.db.add_document(&new_id(), profile_id, name, kind, &pieces);
-        self.session.reload_knowledge();
+        self.db.add_document(&new_id(), profile_id, name, &pieces).map_err(|e| e.to_string())
     }
 
     pub fn remove_doc(&self, id: &str) {
@@ -1426,6 +1502,12 @@ mod tests {
 
     /// Answers every POST with the same OpenAI-style stream, and records the request bodies.
     fn fake_llm(reply: &'static str) -> (u16, Arc<Mutex<Vec<String>>>) {
+        let body = format!("data: {}\n\ndata: [DONE]\n\n", json!({ "choices": [{ "delta": { "content": reply } }] }));
+        fake_http("text/event-stream", body)
+    }
+
+    fn fake_http(content_type: &'static str, body: impl Into<String>) -> (u16, Arc<Mutex<Vec<String>>>) {
+        let body = body.into();
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let seen = Arc::new(Mutex::new(Vec::new()));
@@ -1448,8 +1530,7 @@ mod tests {
                     }
                 }
                 s2.lock().unwrap().push(String::from_utf8_lossy(&req).into_owned());
-                let body = format!("data: {}\n\ndata: [DONE]\n\n", json!({ "choices": [{ "delta": { "content": reply } }] }));
-                let _ = sock.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes());
+                let _ = sock.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes());
             }
         });
         (port, seen)
@@ -1476,6 +1557,86 @@ mod tests {
 
     fn seg(session_id: &str, source: Source, start_ms: i64, end_ms: i64, text: &str) -> TranscriptSegment {
         TranscriptSegment { session_id: session_id.into(), segment_id: new_id(), source, start_ms, end_ms, text: text.into(), is_final: true, lang: None }
+    }
+
+    #[test]
+    fn imports_mixed_profile_files_without_categories_or_losing_successes() {
+        let c = core();
+        let dir = &c.data_dir;
+        let text = dir.join("Проєкти.txt");
+        let markdown = dir.join("Навички.md");
+        let unsupported = dir.join("unsupported.bin");
+        std::fs::write(&text, "Я розробив сервіс звітів у PostgreSQL.").unwrap();
+        std::fs::write(&markdown, "# Навички\nІнтегрував черги повідомлень на Kafka.").unwrap();
+        std::fs::write(&unsupported, "unsupported").unwrap();
+        let profile = c.profile();
+        c.db.add_document("legacy", &profile.id, "Earlier job", &[(String::new(), "Requires Terraform.".into())]).unwrap();
+        rusqlite::Connection::open(dir.join("kairos.db")).unwrap()
+            .execute("UPDATE knowledge_documents SET kind='jd' WHERE id='legacy'", []).unwrap();
+        let report = c.import_docs(&profile.id, &[text, unsupported, markdown]);
+        assert_eq!(report.added, 2);
+        assert_eq!(report.failures.len(), 1);
+        assert!(report.failures[0].contains("unsupported.bin"));
+        let docs = c.db.list_docs(&profile.id);
+        assert_eq!(docs.len(), 3);
+        assert!(docs.iter().any(|d| d.name == "Проєкти.txt"));
+        let chunks = c.db.chunks_for_profile(&profile.id);
+        assert!(chunks.iter().any(|d| d.text.contains("PostgreSQL")));
+        assert!(chunks.iter().any(|d| d.text.contains("Kafka")));
+        assert!(chunks.iter().any(|d| d.doc_name == "Earlier job" && d.role_description));
+    }
+
+    #[test]
+    fn profile_introduction_uses_the_newly_selected_profiles_documents() {
+        let (port, seen) = fake_llm("Profile answer.");
+        let c = core();
+        let previous = c.profile();
+        c.add_profile_text(&previous.id, "Old projects", "I developed the Mercury billing portal.").unwrap();
+        let next = c.upsert_profile(Profile { id: String::new(), name: "Other profile".into(), ..previous });
+        c.add_profile_text(&next.id, "Current projects", "I developed the Halcyon support portal.").unwrap();
+        let server = Found::Server { runtime: "Test", base_url: format!("http://127.0.0.1:{port}/v1"), models: vec!["m".into()] };
+        c.rt.block_on(c.use_found(&server, None)).unwrap();
+        c.session.start(SessionMode::Practice);
+        c.update_settings(|s| s.active_profile_id = next.id);
+        c.session.ask_typed("Розкажіть, будь ласка, про себе");
+        let start = Instant::now();
+        loop {
+            if let Some(request) = seen.lock().unwrap().first() {
+                assert!(request.contains("Halcyon"));
+                assert!(!request.contains("Mercury"));
+                break;
+            }
+            assert!(start.elapsed() < Duration::from_secs(5), "no answer request");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn batch_profile_uses_the_models_api_before_switching_roles() {
+        let body = r#"{"data":[{"id":"other"},{"id":"gemma"}]}"#;
+        let (port, _) = fake_http("application/json", body);
+        let c = core();
+        let path = c.data_dir.join("Gemma launcher.bat");
+        let mut profile = discover::BatchProfile { path, port, alias: Some("gemma".into()), vision: true };
+        c.rt.block_on(c.use_batch(&profile)).unwrap();
+        let settings = c.s();
+        let role = settings.role(ModelRole::QuickAnswer).unwrap();
+        assert_eq!(role.model, "gemma");
+        assert_eq!(settings.role(ModelRole::Vision), Some(role));
+        c.rt.block_on(c.use_batch(&profile)).unwrap();
+        assert_eq!(c.registry.list().len(), 1);
+
+        let conflict = discover::BatchProfile { path: c.data_dir.join("GLM.cmd"), alias: Some("glm".into()), vision: false, ..profile.clone() };
+        assert!(c.rt.block_on(c.use_batch(&conflict)).is_err());
+        assert_eq!(c.s().role(ModelRole::QuickAnswer), Some(role));
+
+        profile.alias = Some("missing".into());
+        assert!(c.rt.block_on(c.use_batch(&profile)).is_err());
+        assert_eq!(c.s().role(ModelRole::QuickAnswer), Some(role));
+
+        profile.port = crate::proc::free_port().unwrap();
+        assert!(c.rt.block_on(c.use_batch(&profile)).is_err());
+        assert_eq!(c.s().role(ModelRole::QuickAnswer), Some(role));
     }
 
     #[test]

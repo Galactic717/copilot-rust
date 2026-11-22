@@ -3,14 +3,12 @@ use std::sync::LazyLock;
 
 use regex::Regex;
 
-use crate::types::DocKind;
-
 #[derive(Debug, Clone, PartialEq)]
 pub struct Chunk {
     pub id: String,
     pub document_id: String,
     pub doc_name: String,
-    pub kind: DocKind,
+    pub role_description: bool,
     pub section: String,
     pub text: String,
 }
@@ -60,6 +58,9 @@ pub fn chunk_text(text: &str, max_chars: usize) -> Vec<(String, String)> {
         buf.push(line.to_string());
     }
     flush(&mut buf, &mut out, &section);
+    if out.is_empty() && !text.trim().is_empty() {
+        out.extend(split_long(text.trim(), max_chars).into_iter().map(|piece| (String::new(), piece)));
+    }
     out
 }
 
@@ -85,6 +86,10 @@ static STOP: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
 });
 
 static TOKEN: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"[\p{L}\p{N}+#.]+").unwrap());
+
+static PROFILE_INTRODUCTION: LazyLock<Regex> = LazyLock::new(|| Regex::new(
+    r"(?i)\b(tell (me|us) (a (little|bit) )?about yourself|introduce yourself|walk (me|us) through your (background|experience|résumé|resume)|describe your background|розка(ж(іть|и)|зати)[ ,]+((будь ласка|трохи|коротко)[ ,]+)?про себе|описати себе|опиш(іть|и) себе|представ(тесь|теся|ся))\b|^\s*(who are you|хто (ви|ти)( так(ий|а|і))?)[?!.\s]*$"
+).unwrap());
 
 /// Cheap stemmer: prefix truncation — enough for BM25 over Ukrainian morphology on a few pages of CV.
 pub fn tokenize(text: &str) -> Vec<String> {
@@ -156,6 +161,31 @@ impl Bm25Index {
         scored.truncate(k);
         scored
     }
+
+    pub fn for_question(&self, question: &str, k: usize) -> Vec<Chunk> {
+        let matches = self.search(question, k);
+        if !PROFILE_INTRODUCTION.is_match(question) {
+            return matches.into_iter().map(|(chunk, _)| chunk).collect();
+        }
+        let relevant = matches.iter().map(|(chunk, _)| chunk).filter(|chunk| !chunk.role_description).take(k / 2);
+        let mut seen = HashSet::new();
+        overview(
+            relevant.chain(self.docs.iter().map(|(chunk, _, _)| chunk))
+                .filter(|chunk| !chunk.role_description && seen.insert(&chunk.id)),
+            k,
+        )
+    }
+}
+
+/// Broad questions benefit from seeing several sources before reading further into any one of them.
+pub fn overview<'a>(chunks: impl Iterator<Item = &'a Chunk>, limit: usize) -> Vec<Chunk> {
+    let mut seen = HashSet::new();
+    let (first, rest): (Vec<_>, Vec<_>) = chunks.partition(|chunk| seen.insert(&chunk.document_id));
+    first.into_iter().chain(rest).take(limit).map(|chunk| {
+        let mut excerpt = chunk.clone();
+        excerpt.text = chunk.text.chars().take(320).collect();
+        excerpt
+    }).collect()
 }
 
 #[cfg(test)]
@@ -169,6 +199,30 @@ mod tests {
     }
 
     #[test]
+    fn profile_introduction_samples_multiple_documents_without_keyword_matches() {
+        let chunk = |doc: &str, id: &str, text: &str| Chunk {
+            id: id.into(), document_id: doc.into(), doc_name: doc.into(), role_description: false,
+            section: String::new(), text: text.into(),
+        };
+        let idx = Bm25Index::new(vec![
+            Chunk { role_description: true, ..chunk("job", "jd", "Tell me about yourself. Required: Terraform certification.") },
+            chunk("projects", "a", "I built payment systems."),
+            chunk("projects", "b", "I deployed a PostgreSQL cluster."),
+            chunk("experience", "c", "I led a team of five people."),
+        ]);
+        for question in ["Розкажіть, будь ласка, про себе", "Could you tell me a little about yourself?", "Можете коротко розказати про себе?", "Хто ти такий?", "Who are you?"] {
+            let docs = idx.for_question(question, 2);
+            assert_eq!(docs.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(), ["a", "c"]);
+        }
+        let matches = idx.for_question("PostgreSQL", 2);
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].id, "b");
+        assert!(idx.for_question("Kubernetes", 2).is_empty());
+        assert!(idx.for_question("Who are you using for observability?", 2).is_empty());
+        assert!(idx.for_question("Terraform", 2)[0].role_description);
+    }
+
+    #[test]
     fn headings_become_sections_and_bm25_finds_relevant() {
         let chunks = chunk_text("ДОСВІД РОБОТИ\nPython FastAPI PostgreSQL сервіс звітів\n\nОСВІТА\nКПІ, прикладна математика", 700);
         assert_eq!(chunks[0].0, "ДОСВІД РОБОТИ");
@@ -176,7 +230,7 @@ mod tests {
             chunks
                 .into_iter()
                 .enumerate()
-                .map(|(i, (section, text))| Chunk { id: i.to_string(), document_id: "d".into(), doc_name: "cv".into(), kind: DocKind::Cv, section, text })
+                .map(|(i, (section, text))| Chunk { id: i.to_string(), document_id: "d".into(), doc_name: "cv".into(), role_description: false, section, text })
                 .collect(),
         );
         let r = idx.search("Який у вас досвід з PostgreSQL?", 3);

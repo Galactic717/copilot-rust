@@ -1,6 +1,6 @@
 # Copilot
 
-**A real-time interview and meeting assistant that runs on your own computer.** It listens to the call, spots the question, and shows a short answer built from your CV. Speech recognition is local. There is no account, no subscription and no server of ours.
+**A real-time interview and meeting assistant that runs on your own computer.** It listens to the call, spots the question, and shows a short answer informed by your profile materials. Speech recognition is local. There is no account, no subscription and no server of ours.
 
 [![CI](https://github.com/Galactic717/copilot-rust/actions/workflows/ci.yml/badge.svg)](https://github.com/Galactic717/copilot-rust/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/Galactic717/copilot-rust)](https://github.com/Galactic717/copilot-rust/releases/latest)
@@ -21,8 +21,8 @@ The exe is not code-signed yet, so Windows SmartScreen shows "Windows protected 
 ## Features
 
 **Before the call**
-- **Mock interview.** The app asks questions drawn from your CV and the job description, you answer aloud, and it scores the answer and writes a stronger version.
-- **Your facts only.** Upload a CV, job description or notes (PDF, DOCX, TXT, MD). Answers about your experience use only those; a claim with no source is marked `[not in CV]` instead of being invented.
+- **Mock interview.** The app asks questions based on your profile materials, reviews your spoken answer and writes a stronger version.
+- **Profile documents.** Add multiple PDF, DOCX, TXT or Markdown files at once, or paste text into the same collection. Copilot uses relevant excerpts to ground answers about your experience.
 
 **During the call**
 - **Small overlay** that never takes keyboard focus, sizes itself to the answer, and has adjustable transparency.

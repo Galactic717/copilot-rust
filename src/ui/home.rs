@@ -56,7 +56,7 @@ pub fn show(ui: &mut egui::Ui, c: &mut Ctx, st: &mut HomeState) {
                         "Підказки лише на мовлення співрозмовника (системний звук). Ваш голос — у транскрипт і контекст.",
                         "Hints only for the other side's speech (system audio). Your voice goes to the transcript and context.",
                     ),
-                    SessionMode::Mock => t("Застосунок ставить питання за вашим резюме й вакансією, ви відповідаєте вголос, а він розбирає відповідь.", "The app asks questions based on your CV and the job, you answer aloud, and it reviews your answer."),
+                    SessionMode::Mock => t("Застосунок ставить питання за матеріалами профілю, ви відповідаєте вголос, а він розбирає відповідь.", "The app asks questions based on your profile materials, you answer aloud, and it reviews your answer."),
                     SessionMode::Meeting => t("Без підказок: транскрипт і підсумок зустрічі зберігаються локально.", "No hints: the meeting transcript and debrief are stored locally."),
                 },
             );

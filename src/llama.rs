@@ -21,6 +21,8 @@ pub enum LlamaState {
 
 struct Proc {
     child: Child,
+    job: Option<crate::proc::Job>,
+    port: u16,
     state: Arc<Mutex<LlamaState>>,
     log: Arc<Mutex<Vec<String>>>,
 }
@@ -59,7 +61,16 @@ impl LlamaManager {
     }
 
     pub fn stop(&self, id: &str) {
-        if let Some(mut p) = self.procs.lock().unwrap().remove(id) {
+        self.stop_current(id, None);
+    }
+
+    fn stop_current(&self, id: &str, expected: Option<&Arc<Mutex<LlamaState>>>) {
+        let mut procs = self.procs.lock().unwrap();
+        if expected.is_some_and(|state| !procs.get(id).is_some_and(|p| Arc::ptr_eq(&p.state, state))) {
+            return;
+        }
+        if let Some(mut p) = procs.remove(id) {
+            drop(p.job.take());
             let _ = p.child.kill();
             let _ = p.child.wait();
         }
@@ -76,6 +87,9 @@ impl LlamaManager {
     /// Starts llama-server for `cfg` (if configured and not already up) and waits until the model is loaded.
     pub async fn ensure(&self, cfg: &ProviderConfig, net: &Net) -> Result<(), String> {
         let Some(launch) = cfg.llama.as_ref().filter(|l| !l.server_path.trim().is_empty()) else { return Ok(()) };
+        if crate::discover::is_batch(std::path::Path::new(&launch.server_path)) && !crate::net::is_loopback_url(&cfg.base_url) {
+            return Err(t("Для скрипта запуску потрібна локальна адреса API", "A launch script requires a local API address").into());
+        }
         if matches!(self.state(&cfg.id), LlamaState::Running) {
             return Ok(());
         }
@@ -84,32 +98,78 @@ impl LlamaManager {
             return Ok(());
         }
         if !matches!(self.state(&cfg.id), LlamaState::Starting) {
-            self.spawn(cfg, launch)?;
+            if let Err(err) = self.spawn(cfg, launch) {
+                self.failures.lock().unwrap().insert(cfg.id.clone(), err.clone());
+                return Err(err);
+            }
         }
         let state = self.procs.lock().unwrap().get(&cfg.id).map(|p| p.state.clone());
         let Some(state) = state else { return Err(t("llama-server не запущено", "llama-server is not running").into()) };
         // A 30B GGUF from a spinning disk can take minutes to map; I wait up to 5 minutes.
         let deadline = Instant::now() + Duration::from_secs(300);
         while Instant::now() < deadline {
-            if let LlamaState::Failed(m) = self.state(&cfg.id) {
-                return Err(m);
+            match self.state(&cfg.id) {
+                LlamaState::Failed(m) => return Err(m),
+                LlamaState::Stopped => return Err(t("Запуск зупинено", "Launch stopped").into()),
+                _ => {}
             }
             if healthy(net, &cfg.base_url).await {
+                let procs = self.procs.lock().unwrap();
+                if !procs.get(&cfg.id).is_some_and(|p| Arc::ptr_eq(&p.state, &state)) {
+                    return Err(t("Запуск зупинено", "Launch stopped").into());
+                }
                 *state.lock().unwrap() = LlamaState::Running;
                 return Ok(());
             }
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
-        self.stop(&cfg.id);
+        self.stop_current(&cfg.id, Some(&state));
         Err(t("llama-server не завантажив модель за 5 хв", "llama-server did not load the model within 5 min").into())
     }
 
     fn spawn(&self, cfg: &ProviderConfig, l: &LlamaLaunch) -> Result<(), String> {
+        let mut procs = self.procs.lock().unwrap();
+        if procs.contains_key(&cfg.id) {
+            return Ok(());
+        }
         let server = std::path::Path::new(l.server_path.trim());
         if !server.is_file() {
             return Err(crate::tr!("Не знайдено llama-server: {}", "llama-server not found: {}", server.display()));
         }
         let port = port_of(&cfg.base_url).ok_or_else(|| t("В адресі немає порту", "The address has no port").to_string())?;
+        let (mut child, job) = if crate::discover::is_batch(server) {
+            if procs.values_mut().any(|p| p.port == port && !matches!(p.child.try_wait(), Ok(Some(_)))) {
+                return Err(t("Порт цього профілю вже використовує інший локальний сервер", "Another local server is already using this profile's port").into());
+            }
+            let path = std::path::absolute(server).map_err(|e| e.to_string())?;
+            let (child, job) = crate::proc::spawn_batch(&path).map_err(|e| e.to_string())?;
+            (child, Some(job))
+        } else {
+            (Self::spawn_server(server, port, l)?, None)
+        };
+        let log = Arc::new(Mutex::new(Vec::new()));
+        for pipe in [child.stdout.take().map(|p| Box::new(p) as Box<dyn std::io::Read + Send>), child.stderr.take().map(|p| Box::new(p) as Box<dyn std::io::Read + Send>)]
+            .into_iter()
+            .flatten()
+        {
+            let log = log.clone();
+            std::thread::spawn(move || {
+                for line in BufReader::new(pipe).lines().map_while(Result::ok) {
+                    let mut l = log.lock().unwrap();
+                    l.push(line.chars().take(300).collect());
+                    if l.len() > 200 {
+                        l.remove(0);
+                    }
+                }
+            });
+        }
+        self.failures.lock().unwrap().remove(&cfg.id);
+        procs.insert(cfg.id.clone(), Proc { child, job, port, state: Arc::new(Mutex::new(LlamaState::Starting)), log });
+        crate::db::diag("llama_start", serde_json::json!({ "port": port }));
+        Ok(())
+    }
+
+    fn spawn_server(server: &std::path::Path, port: u16, l: &LlamaLaunch) -> Result<Child, String> {
         let mut cmd = Command::new(server);
         if is_ollama(server) {
             cmd.arg("serve").env("OLLAMA_HOST", format!("127.0.0.1:{port}"));
@@ -135,27 +195,7 @@ impl LlamaManager {
             cmd.current_dir(dir);
         }
         cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
-        let mut child = crate::proc::spawn_hidden(&mut cmd).map_err(|e| e.to_string())?;
-        let log = Arc::new(Mutex::new(Vec::new()));
-        for pipe in [child.stdout.take().map(|p| Box::new(p) as Box<dyn std::io::Read + Send>), child.stderr.take().map(|p| Box::new(p) as Box<dyn std::io::Read + Send>)]
-            .into_iter()
-            .flatten()
-        {
-            let log = log.clone();
-            std::thread::spawn(move || {
-                for line in BufReader::new(pipe).lines().map_while(Result::ok) {
-                    let mut l = log.lock().unwrap();
-                    l.push(line.chars().take(300).collect());
-                    if l.len() > 200 {
-                        l.remove(0);
-                    }
-                }
-            });
-        }
-        self.failures.lock().unwrap().remove(&cfg.id);
-        self.procs.lock().unwrap().insert(cfg.id.clone(), Proc { child, state: Arc::new(Mutex::new(LlamaState::Starting)), log });
-        crate::db::diag("llama_start", serde_json::json!({ "port": port }));
-        Ok(())
+        crate::proc::spawn_hidden(&mut cmd).map_err(|e| e.to_string())
     }
 }
 
@@ -167,8 +207,13 @@ fn is_ollama(server: &std::path::Path) -> bool {
 async fn healthy(net: &Net, base_url: &str) -> bool {
     for url in [format!("{}/health", root_of(base_url)), format!("{}/models", base_url.trim_end_matches('/'))] {
         if let Ok(rb) = net.get(&url) {
-            if matches!(rb.timeout(Duration::from_secs(2)).send().await, Ok(r) if r.status().is_success()) {
-                return true;
+            if let Ok(res) = rb.timeout(Duration::from_secs(2)).send().await {
+                if res.status().is_success() {
+                    return true;
+                }
+                if res.status() == reqwest::StatusCode::SERVICE_UNAVAILABLE {
+                    return false;
+                }
             }
         }
     }
@@ -184,6 +229,20 @@ mod tests {
     use crate::providers::runner::{run_stream, RunOptions};
     use crate::providers::{create_adapter, AdapterDeps};
     use crate::types::*;
+
+    #[test]
+    fn batch_launch_preserves_path_working_directory_and_no_pause_argument() {
+        let dir = std::env::temp_dir().join(format!("Copilot batch & (test) %TEMP% {}", new_id()));
+        std::fs::create_dir(&dir).unwrap();
+        for ext in ["bat", "cmd"] {
+            let script = dir.join(format!("Test & (model) %TEMP%.{ext}"));
+            std::fs::write(&script, format!("@echo off\r\nif not \"%~1\"==\"--no-pause\" exit /b 21\r\necho {ext}>relative.txt\r\nexit /b 0\r\n")).unwrap();
+            let (mut child, _job) = crate::proc::spawn_batch(&script).unwrap();
+            assert!(child.wait().unwrap().success());
+            assert_eq!(std::fs::read_to_string(dir.join("relative.txt")).unwrap().trim(), ext);
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     /// Live check of the one-click path. `COPILOT_TEST_DIR` holds `llama/` as unpacked from the full exe; the recommended
     /// small model is downloaded there once: `COPILOT_TEST_DIR=<dir> cargo test live_llama -- --ignored --nocapture`
