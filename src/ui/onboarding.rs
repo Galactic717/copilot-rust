@@ -1,6 +1,6 @@
 use eframe::egui::{self, RichText};
 
-use super::profile::{kind_label, preset_label, start_import};
+use super::profile::{preset_label, DocumentImport};
 use super::providers::{local_panel, start_test, test_result, FormResult, LocalUi, ModelPicker, ProviderForm};
 use super::settings_page::{answer_lang_options, asr_installer, asr_lang_options, device_settings, ui_lang_options, AudioUi};
 use super::theme::p;
@@ -21,8 +21,7 @@ pub struct OnboardingState {
     picker: ModelPicker,
     test: Option<Promise<ProviderTestReport>>,
     report: Option<ProviderTestReport>,
-    import: Option<Promise<Option<Result<(), String>>>>,
-    import_err: Option<String>,
+    import: DocumentImport,
     typed: String,
     test_until: Option<std::time::Instant>,
     agree: bool,
@@ -40,8 +39,7 @@ impl Default for OnboardingState {
             picker: ModelPicker::default(),
             test: None,
             report: None,
-            import: None,
-            import_err: None,
+            import: DocumentImport::default(),
             typed: String::new(),
             test_until: None,
             agree: false,
@@ -151,8 +149,8 @@ fn step_lang(ui: &mut egui::Ui, c: &mut Ctx) {
     h1(ui, t("Ласкаво просимо до Copilot", "Welcome to Copilot"));
     ui.add(
         egui::Label::new(muted(t(
-            "Помічник слухає розмову, вчасно помічає питання й показує коротку відповідь з опорою на ваше резюме. Розпізнавання мовлення — на цьому комп'ютері, модель для відповідей ви обираєте самі.",
-            "The assistant listens to the conversation, notices questions in time and shows a short answer based on your CV. Speech recognition runs on this computer; you choose the answer model.",
+            "Помічник слухає розмову, помічає питання й показує коротку відповідь з опорою на матеріали профілю. Розпізнавання мовлення працює на цьому комп'ютері. Модель для відповідей ви обираєте самі.",
+            "The assistant listens to the conversation, notices questions and shows a short answer based on your profile materials. Speech recognition runs on this computer. You choose the answer model.",
         )))
         .wrap(),
     );
@@ -280,26 +278,12 @@ fn step_profile(ui: &mut egui::Ui, c: &mut Ctx, st: &mut OnboardingState) {
             }
         }
     });
-    if let Some(r) = st.import.as_ref().and_then(|x| x.take()) {
-        st.import = None;
-        st.import_err = match r {
-            Some(Err(e)) => Some(e),
-            _ => None,
-        };
-    }
-    ui.horizontal(|ui| {
-        if btn(ui, t("Завантажити резюме (PDF/DOCX/TXT)", "Upload CV (PDF/DOCX/TXT)")) && st.import.is_none() {
-            st.import = Some(start_import(&core, p.id.clone(), DocKind::Cv));
-        }
-        if button(ui, kind_label(DocKind::Jd), Kind::Ghost, false, true).clicked() && st.import.is_none() {
-            st.import = Some(start_import(&core, p.id.clone(), DocKind::Jd));
-        }
-    });
-    error_text(ui, &st.import_err);
+    st.import.button(ui, &core, &p.id);
+    st.import.status(ui, &p.id);
     for d in core.db.list_docs(&p.id) {
         ui.label(small(tr!("✓ {} — {} фрагм.", "✓ {} — {} chunks", d.name, d.chunks)));
     }
-    note(ui, t("Відповіді про ваш досвід будуються лише на завантажених фактах. Чого немає в резюме, застосунок не вигадує.", "Answers about your experience use only uploaded facts. What is not in the CV, the app does not invent."));
+    note(ui, t("Відповіді про ваш досвід спираються на матеріали профілю.", "Answers about your experience draw on your profile materials."));
 }
 
 fn step_test(ui: &mut egui::Ui, c: &mut Ctx, st: &mut OnboardingState) {

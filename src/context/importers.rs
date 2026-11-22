@@ -72,9 +72,9 @@ fn extract_pdf(data: &[u8]) -> Result<String, String> {
     Ok(pages
         .iter()
         .enumerate()
-        .map(|(i, p)| {
+        .filter_map(|(i, p)| {
             let lines: Vec<&str> = p.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
-            format!("## {label} {}\n{}", i + 1, lines.join("\n"))
+            (!lines.is_empty()).then(|| format!("## {label} {}\n{}", i + 1, lines.join("\n")))
         })
         .collect::<Vec<_>>()
         .join("\n\n"))

@@ -8,7 +8,7 @@ Copilot has no server, no account and no telemetry. This page lists everything t
 |---|---|---|
 | Audio | Memory only | Recognized by whisper.cpp on this PC. Never written to disk, never sent anywhere. |
 | Transcripts, questions, answers, debriefs | `%APPDATA%\copilot\kairos.db` (SQLite) | Only if you allow history. Delete a session or everything from History at any time. |
-| CV, job description, notes | The same database | Text is extracted and indexed locally. |
+| Profile documents and notes | The same database | Text is extracted and indexed locally. |
 | API keys | `%APPDATA%\copilot\keys.dpapi.json` | Encrypted by Windows DPAPI under your account, so a copy of the file is useless on another machine or account. |
 | Diagnostics log | The same database | No keys and no conversation text. |
 

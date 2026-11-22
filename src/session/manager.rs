@@ -71,7 +71,7 @@ pub struct State {
     board: AnswerBoard,
     inflight: HashMap<String, Inflight>,
     finals: Vec<TranscriptSegment>,
-    index: Option<Bm25Index>,
+    index: Option<(String, Bm25Index)>,
     started_at: i64,
     persist: bool,
     answer_user_source: bool,
@@ -308,8 +308,9 @@ impl SessionManager {
     }
 
     fn reload_knowledge_locked(&self, st: &mut State) {
-        let chunks = self.d.db().chunks_for_profile(&self.d.profile().id);
-        st.index = if chunks.is_empty() { None } else { Some(Bm25Index::new(chunks)) };
+        let profile_id = self.d.profile().id;
+        let chunks = self.d.db().chunks_for_profile(&profile_id);
+        st.index = (!chunks.is_empty()).then(|| (profile_id, Bm25Index::new(chunks)));
     }
 
     pub fn set_status(&self, key: StatusKey, s: ComponentStatus) {
@@ -642,8 +643,8 @@ impl SessionManager {
             return fail(self, st, base, AnswerStatus::Blocked, e, then);
         }
         let window_start = q.end_ms - s.context_window_min as i64 * 60_000;
-        let knowledge = st.index.as_ref().map(|i| i.search(&q.text, 8).into_iter().map(|r| r.0).collect()).unwrap_or_default();
         let profile = self.d.profile();
+        let knowledge = st.index.as_ref().filter(|(id, _)| id == &profile.id).map(|(_, index)| index.for_question(&q.text, 8)).unwrap_or_default();
         let earlier: Vec<String> = st
             .coord
             .as_ref()

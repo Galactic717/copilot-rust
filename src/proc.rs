@@ -1,10 +1,14 @@
 //! Child processes (whisper-server, llama-server): hidden console, and tied to a kill-on-close job object so they
 //! never outlive the app, even after a crash.
 
-use std::process::{Child, Command};
+use std::io::{self, Write};
+use std::os::windows::io::AsRawHandle;
+use std::os::windows::process::CommandExt;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
 use std::sync::OnceLock;
 
-use windows::Win32::Foundation::HANDLE;
+use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation, SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
     JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
@@ -12,39 +16,64 @@ use windows::Win32::System::JobObjects::{
 
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
-struct Job(HANDLE);
+pub struct Job(HANDLE);
 // The job handle is only used for AssignProcessToJobObject, which is thread-safe.
 unsafe impl Send for Job {}
 unsafe impl Sync for Job {}
 
-fn job() -> Option<&'static Job> {
-    static JOB: OnceLock<Option<Job>> = OnceLock::new();
-    JOB.get_or_init(|| unsafe {
-        let h = CreateJobObjectW(None, None).ok()?;
-        let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-        SetInformationJobObject(
-            h,
-            JobObjectExtendedLimitInformation,
-            &info as *const _ as *const core::ffi::c_void,
-            std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-        )
-        .ok()?;
-        Some(Job(h))
-    })
-    .as_ref()
+impl Job {
+    fn new() -> windows::core::Result<Self> {
+        unsafe {
+            let job = Self(CreateJobObjectW(None, None)?);
+            let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            SetInformationJobObject(job.0, JobObjectExtendedLimitInformation, (&raw const info).cast(), std::mem::size_of_val(&info) as u32)?;
+            Ok(job)
+        }
+    }
+
+    fn attach(&self, child: &Child) -> windows::core::Result<()> {
+        unsafe { AssignProcessToJobObject(self.0, HANDLE(child.as_raw_handle())) }
+    }
+}
+
+impl Drop for Job {
+    fn drop(&mut self) {
+        let _ = unsafe { CloseHandle(self.0) };
+    }
 }
 
 pub fn spawn_hidden(cmd: &mut Command) -> std::io::Result<Child> {
-    use std::os::windows::io::AsRawHandle;
-    use std::os::windows::process::CommandExt;
+    static JOB: OnceLock<Option<Job>> = OnceLock::new();
     let child = cmd.creation_flags(CREATE_NO_WINDOW).spawn()?;
-    if let Some(j) = job() {
-        unsafe {
-            let _ = AssignProcessToJobObject(j.0, HANDLE(child.as_raw_handle()));
-        }
+    if let Some(job) = JOB.get_or_init(|| Job::new().ok()) {
+        let _ = job.attach(&child);
     }
     Ok(child)
+}
+
+pub fn spawn_batch(path: &Path) -> io::Result<(Child, Job)> {
+    let job = Job::new()?;
+    let system = std::env::var_os("SystemRoot").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
+    let mut child = Command::new(system.join("System32").join("cmd.exe"))
+        .args(["/D", "/Q", "/V:OFF"])
+        .env("COPILOT_BATCH_PATH", path)
+        .current_dir(path.parent().expect("absolute batch path"))
+        .creation_flags(CREATE_NO_WINDOW)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    // Hold the shell at stdin until its children are guaranteed to inherit this job.
+    let start = job.attach(&child).map_err(io::Error::other).and_then(|()| {
+        child.stdin.take().expect("piped shell stdin").write_all(b"\"%COPILOT_BATCH_PATH%\" --no-pause\r\nexit /b %ERRORLEVEL%\r\n")
+    });
+    if let Err(e) = start {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(e);
+    }
+    Ok((child, job))
 }
 
 // whisper-server and llama-server are built against the VC++ runtime. build.rs embeds its DLLs, so the sidecars start on

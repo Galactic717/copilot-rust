@@ -74,13 +74,22 @@ impl ProviderForm {
 
     pub fn show(&mut self, ui: &mut egui::Ui, core: &Arc<Core>, cancellable: bool) -> FormResult {
         let mut result = FormResult::None;
-        if let Some(Some((is_model, path))) = self.browse.as_ref().and_then(|p| p.take()) {
-            if is_model {
-                self.llama.model_path = path;
-            } else {
-                self.llama.server_path = path;
-            }
+        if let Some(picked) = self.browse.as_ref().and_then(|p| p.take()) {
             self.browse = None;
+            if let Some((is_model, path)) = picked {
+                if is_model {
+                    self.llama.model_path = path;
+                } else {
+                    if let Some(profile) = discover::batch_profile(std::path::PathBuf::from(&path)) {
+                        self.base_url = profile.base_url();
+                        if self.initial.is_none() {
+                            self.label = profile.name();
+                            self.llama.auto_start = false;
+                        }
+                    }
+                    self.llama.server_path = path;
+                }
+            }
         }
         let editing = self.initial.is_some();
         ui.horizontal_wrapped(|ui| {
@@ -188,31 +197,41 @@ impl ProviderForm {
 
     fn llama_section(&mut self, ui: &mut egui::Ui, core: &Arc<Core>) {
         card_fill(ui, p().surface2, |ui| {
+            let batch = discover::is_batch(std::path::Path::new(self.llama.server_path.trim()));
             h3(ui, t("Запуск llama-server із застосунку (необов'язково)", "Start llama-server from the app (optional)"));
-            note(
-                ui,
-                t(
-                    "Вкажіть llama-server.exe (з релізу llama.cpp) і модель .gguf — застосунок сам запустить сервер на порту з адреси вище, дочекається завантаження моделі й зупинить його при виході. Якщо сервер уже запущено вами — залиште порожнім.",
-                    "Point to llama-server.exe (from a llama.cpp release) and a .gguf model — the app starts the server on the port from the address above, waits for the model to load and stops it on exit. If you run the server yourself, leave this empty.",
-                ),
-            );
-            for (is_model, label, filter) in [(false, "llama-server.exe", "exe"), (true, t("Модель GGUF", "GGUF model"), "gguf")] {
+            if !batch {
+                note(
+                    ui,
+                    t(
+                        "Вкажіть llama-server.exe (з релізу llama.cpp) і модель .gguf — застосунок сам запустить сервер на порту з адреси вище, дочекається завантаження моделі й зупинить його при виході. Якщо сервер уже запущено вами — залиште порожнім.",
+                        "Point to llama-server.exe (from a llama.cpp release) and a .gguf model — the app starts the server on the port from the address above, waits for the model to load and stops it on exit. If you run the server yourself, leave this empty.",
+                    ),
+                );
+            }
+            for (is_model, label, extensions) in [(false, "llama-server.exe / .bat / .cmd", &["exe", "bat", "cmd"][..]), (true, t("Модель GGUF", "GGUF model"), &["gguf"][..])] {
+                if is_model && batch {
+                    continue;
+                }
                 field(ui, label, |ui| {
                     ui.horizontal(|ui| {
                         let v = if is_model { &mut self.llama.model_path } else { &mut self.llama.server_path };
                         ui.add(egui::TextEdit::singleline(v).font(egui::TextStyle::Monospace).desired_width(ui.available_width() - 90.0).margin(egui::Margin::symmetric(8, 6)));
                         if btn_sm(ui, t("Огляд…", "Browse…")) && self.browse.is_none() {
                             self.browse = Some(Promise::thread(core, move || {
-                                rfd::FileDialog::new().add_filter(filter, &[filter]).pick_file().map(|p| (is_model, p.display().to_string()))
+                                rfd::FileDialog::new().add_filter(label, extensions).pick_file().map(|p| (is_model, p.display().to_string()))
                             }));
                         }
                     });
                 });
             }
-            ui.horizontal(|ui| {
-                field(ui, t("Контекст, токенів", "Context, tokens"), |ui| ui.add(egui::DragValue::new(&mut self.llama.ctx_size).range(0..=262_144).speed(256)));
-                field(ui, t("Шарів на GPU (0 — авто)", "GPU layers (0 — auto)"), |ui| ui.add(egui::DragValue::new(&mut self.llama.gpu_layers).range(0..=999)));
-            });
+            if batch {
+                note(ui, t("Параметри запуску беруться зі скрипта. Адреса API має відповідати його порту.", "Launch options come from the script. The API address must match its port."));
+            } else {
+                ui.horizontal(|ui| {
+                    field(ui, t("Контекст, токенів", "Context, tokens"), |ui| ui.add(egui::DragValue::new(&mut self.llama.ctx_size).range(0..=262_144).speed(256)));
+                    field(ui, t("Шарів на GPU (0 — авто)", "GPU layers (0 — auto)"), |ui| ui.add(egui::DragValue::new(&mut self.llama.gpu_layers).range(0..=999)));
+                });
+            }
             toggle(ui, &mut self.llama.auto_start, t("Запускати автоматично на початку сесії", "Start automatically when a session starts"), None);
             if let Some(cfg) = &self.initial {
                 llama_controls(ui, core, &cfg.id);
@@ -252,7 +271,7 @@ fn is_active(core: &Core, s: &Settings, f: &Found, model: Option<&str>) -> bool 
     let Some(cfg) = core.registry.get(&role.provider_id) else { return false };
     match f {
         Found::Server { base_url, .. } | Found::Stopped { base_url, .. } => &cfg.base_url == base_url && model == Some(role.model.as_str()),
-        Found::Gguf(m) => cfg.llama.is_some_and(|l| l.model_path == m.path.display().to_string()),
+        Found::Gguf(m) => cfg.llama.is_some_and(|l| l.model_path == m.path.display().to_string() && !discover::is_batch(std::path::Path::new(&l.server_path))),
     }
 }
 
@@ -267,6 +286,12 @@ pub fn local_panel(ui: &mut egui::Ui, core: &Arc<Core>, st: &mut LocalUi) {
     let busy = st.using.is_some();
     let s = core.s();
     let ram = crate::win::total_ram();
+    let batches = core.batch_profiles.lock().unwrap().clone();
+    error_text(ui, &st.err);
+    if !batches.is_empty() {
+        batch_panel(ui, core, st, &s, &batches);
+        ui.add_space(8.0);
+    }
     card_fill(ui, p().surface2, |ui| {
         ui.horizontal(|ui| {
             h3(ui, t("Локальні моделі на цьому комп'ютері", "Local models on this computer"));
@@ -325,7 +350,50 @@ pub fn local_panel(ui: &mut egui::Ui, core: &Arc<Core>, st: &mut LocalUi) {
         if (total == 0 && found.is_some() && !scanning) || st.show_offers {
             offers(ui, core, st, ram, busy);
         }
-        error_text(ui, &st.err);
+    });
+}
+
+fn batch_panel(ui: &mut egui::Ui, core: &Arc<Core>, st: &mut LocalUi, settings: &Settings, batches: &[discover::BatchProfile]) {
+    card_fill(ui, p().surface2, |ui| {
+        h3(ui, t("Профілі запуску llama.cpp", "llama.cpp launch profiles"));
+        for profile in batches {
+            let cfg = core.batch_provider(&profile.path);
+            let state = cfg.as_ref().map(|c| core.llama_state(&c.id)).unwrap_or(LlamaState::Stopped);
+            let active = cfg.as_ref().is_some_and(|c| settings.role(ModelRole::QuickAnswer).is_some_and(|r| r.provider_id == c.id));
+            let running = state == LlamaState::Running;
+            let starting = state == LlamaState::Starting;
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new(profile.name()).strong());
+                ui.label(faint(profile.base_url()));
+                if active {
+                    chip(ui, t("використовується", "in use"), true);
+                }
+                if running {
+                    chip(ui, t("працює", "running"), true);
+                } else if starting {
+                    ui.label(faint(t("завантажує модель…", "loading the model…")));
+                }
+                if !running || !active {
+                    let label = if running { t("Використати", "Use") } else { t("Запустити й використовувати", "Start and use") };
+                    if button(ui, label, Kind::Primary, true, !starting && st.using.is_none()).clicked() {
+                        let (task, profile) = (core.clone(), profile.clone());
+                        st.err = None;
+                        st.using = Some(Promise::spawn(core, async move { task.use_batch(&profile).await }));
+                    }
+                }
+                if let Some(cfg) = cfg.as_ref().filter(|_| running || starting) {
+                    if btn_sm(ui, t("Зупинити", "Stop")) {
+                        core.llama.stop(&cfg.id);
+                    }
+                }
+            });
+            if let LlamaState::Failed(error) = state {
+                ui.label(RichText::new(error).color(p().err));
+            }
+            if running || starting || st.using.is_some() {
+                ui.ctx().request_repaint_after(std::time::Duration::from_millis(500));
+            }
+        }
     });
 }
 

@@ -409,7 +409,7 @@ pub enum ProviderProtocol {
     Gemini,
 }
 
-/// How to start llama-server from the app (only for the llama.cpp preset). The port comes from the base URL.
+/// A llama.cpp executable or a .bat/.cmd launcher. For scripts, model and runtime flags come from the script.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase", default)]
 pub struct LlamaLaunch {
@@ -611,37 +611,11 @@ pub struct Profile {
     pub notes: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DocKind {
-    Cv,
-    Jd,
-    Notes,
-}
-
-impl DocKind {
-    pub const ALL: [DocKind; 3] = [DocKind::Cv, DocKind::Jd, DocKind::Notes];
-    pub fn as_str(self) -> &'static str {
-        match self {
-            DocKind::Cv => "cv",
-            DocKind::Jd => "jd",
-            DocKind::Notes => "notes",
-        }
-    }
-    pub fn parse(s: &str) -> Self {
-        match s {
-            "jd" => DocKind::Jd,
-            "notes" => DocKind::Notes,
-            _ => DocKind::Cv,
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq)]
 pub struct KnowledgeDoc {
     pub id: String,
     pub profile_id: String,
     pub name: String,
-    pub kind: DocKind,
     pub chunks: i64,
     pub created_at: i64,
 }

@@ -316,34 +316,34 @@ impl Db {
         );
     }
 
-    pub fn delete_profile(&self, id: &str) {
-        let docs = self.list_docs(id);
-        let c = self.conn.lock().unwrap();
-        if let Ok(tx) = c.unchecked_transaction() {
-            for d in docs {
-                let _ = tx.execute("DELETE FROM knowledge_chunks WHERE document_id=?", [&d.id]);
-                let _ = tx.execute("DELETE FROM knowledge_documents WHERE id=?", [&d.id]);
-            }
-            let _ = tx.execute("DELETE FROM profiles WHERE id=?", [id]);
-            let _ = tx.commit();
-        };
+    pub fn delete_profile(&self, id: &str) -> rusqlite::Result<()> {
+        let mut c = self.conn.lock().unwrap();
+        let tx = c.transaction()?;
+        tx.execute("DELETE FROM knowledge_chunks WHERE document_id IN (SELECT id FROM knowledge_documents WHERE profile_id=?)", [id])?;
+        tx.execute("DELETE FROM knowledge_documents WHERE profile_id=?", [id])?;
+        tx.execute("DELETE FROM profiles WHERE id=?", [id])?;
+        tx.commit()
     }
 
-    pub fn add_document(&self, id: &str, profile_id: &str, name: &str, kind: DocKind, chunks: &[(String, String)]) {
-        let c = self.conn.lock().unwrap();
-        if let Ok(tx) = c.unchecked_transaction() {
-            let _ = tx.execute(
-                "INSERT INTO knowledge_documents(id, profile_id, name, kind, created_at) VALUES (?,?,?,?,?)",
-                params![id, profile_id, name, kind.as_str(), now_ms()],
-            );
+    pub fn add_document(&self, id: &str, profile_id: &str, name: &str, chunks: &[(String, String)]) -> rusqlite::Result<()> {
+        let mut c = self.conn.lock().unwrap();
+        let tx = c.transaction()?;
+        // Keep the existing column so previously imported documents and older builds can still open the database.
+        let inserted = tx.execute(
+            "INSERT INTO knowledge_documents(id, profile_id, name, kind, created_at)
+             SELECT ?, id, ?, 'document', ? FROM profiles WHERE id=?",
+            params![id, name, now_ms(), profile_id],
+        )?;
+        if inserted == 0 {
+            return Err(rusqlite::Error::QueryReturnedNoRows);
+        }
+        {
+            let mut insert = tx.prepare("INSERT INTO knowledge_chunks(id, document_id, ord, section, text, trust) VALUES (?,?,?,?,?,'user_provided')")?;
             for (n, (section, text)) in chunks.iter().enumerate() {
-                let _ = tx.execute(
-                    "INSERT INTO knowledge_chunks(id, document_id, ord, section, text, trust) VALUES (?,?,?,?,?,'user_provided')",
-                    params![new_id(), id, n as i64, section, text],
-                );
+                insert.execute(params![new_id(), id, n as i64, section, text])?;
             }
-            let _ = tx.commit();
-        };
+        }
+        tx.commit()
     }
 
     pub fn list_docs(&self, profile_id: &str) -> Vec<KnowledgeDoc> {
@@ -356,7 +356,6 @@ impl Db {
             id: s(r, "id"),
             profile_id: s(r, "profile_id"),
             name: s(r, "name"),
-            kind: DocKind::parse(&s(r, "kind")),
             chunks: i(r, "n"),
             created_at: i(r, "created_at"),
         })
@@ -365,8 +364,8 @@ impl Db {
 
     pub fn chunks_for_profile(&self, profile_id: &str) -> Vec<Chunk> {
         self.rows(
-            "SELECT c.*, d.name AS doc_name, d.kind AS doc_kind FROM knowledge_chunks c JOIN knowledge_documents d ON d.id=c.document_id
-             WHERE d.profile_id=? ORDER BY d.created_at, c.ord",
+            "SELECT c.*, d.name AS doc_name, (d.kind = 'jd') AS role_description FROM knowledge_chunks c JOIN knowledge_documents d ON d.id=c.document_id
+             WHERE d.profile_id=? ORDER BY d.created_at, d.rowid, c.ord",
             &[&profile_id],
         )
         .iter()
@@ -374,7 +373,7 @@ impl Db {
             id: s(r, "id"),
             document_id: s(r, "document_id"),
             doc_name: s(r, "doc_name"),
-            kind: DocKind::parse(&s(r, "doc_kind")),
+            role_description: i(r, "role_description") != 0,
             section: s(r, "section"),
             text: s(r, "text"),
         })

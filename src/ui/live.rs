@@ -283,7 +283,7 @@ fn mock_panel(ui: &mut egui::Ui, c: &mut Ctx, st: &mut LiveState, has_question: 
     let feedback = core.mock.feedback.lock().unwrap().clone();
     card(ui, |ui| {
         h2(ui, t("Тренувальне інтерв'ю", "Mock interview"));
-        note(ui, t("Відповідайте вголос: мікрофон уже слухає. Потім натисніть «Оцінити». Питання будуються за вашим профілем, резюме й вакансією.", "Answer aloud: the microphone is listening. Then press “Review”. Questions come from your profile, CV and the job."));
+        note(ui, t("Дайте відповідь і натисніть «Оцінити». Питання будуються за матеріалами профілю.", "Answer, then press “Review”. Questions draw on your profile materials."));
         ui.horizontal_wrapped(|ui| {
             if button(ui, if question.busy { t("Готую питання…", "Preparing a question…") } else { t("Наступне питання", "Next question") }, Kind::Primary, false, !question.busy).clicked() {
                 st.mock_answer.clear();

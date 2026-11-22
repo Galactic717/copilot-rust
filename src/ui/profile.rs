@@ -1,7 +1,10 @@
+use std::sync::Arc;
+
 use eframe::egui;
 
 use super::widgets::*;
 use super::Ctx;
+use crate::core::{Core, ImportReport};
 use crate::i18n::t;
 use crate::tr;
 use crate::types::*;
@@ -27,30 +30,58 @@ pub fn style_label(s: AnswerStyle) -> &'static str {
     }
 }
 
-pub fn kind_label(k: DocKind) -> &'static str {
-    match k {
-        DocKind::Cv => t("Резюме", "CV"),
-        DocKind::Jd => t("Вакансія", "Job description"),
-        DocKind::Notes => t("Нотатки", "Notes"),
-    }
-}
-
 #[derive(Default)]
 pub struct ProfileState {
     draft: Option<Profile>,
     err: Option<String>,
-    paste: Option<(DocKind, String)>,
+    paste: Option<String>,
     saved_at: Option<std::time::Instant>,
-    import: Option<Promise<Option<Result<(), String>>>>,
+    import: DocumentImport,
 }
 
-/// File dialog + local extraction off the UI thread.
-pub fn start_import(core: &std::sync::Arc<crate::core::Core>, profile_id: String, kind: DocKind) -> Promise<Option<Result<(), String>>> {
-    let c2 = core.clone();
-    Promise::thread(core, move || {
-        let path = rfd::FileDialog::new().set_title(t("Виберіть документ", "Choose a document")).add_filter(t("Документи", "Documents"), &["pdf", "docx", "txt", "md"]).pick_file()?;
-        Some(c2.import_doc(&profile_id, kind, &path))
-    })
+#[derive(Default)]
+pub struct DocumentImport {
+    pending: Option<Promise<Option<ImportReport>>>,
+    report: Option<ImportReport>,
+    profile_id: String,
+}
+
+impl DocumentImport {
+    pub fn button(&mut self, ui: &mut egui::Ui, core: &Arc<Core>, profile_id: &str) {
+        if button(ui, t("Додати файли", "Add files"), Kind::Primary, true, self.pending.is_none()).clicked() {
+            self.report = None;
+            self.profile_id = profile_id.to_string();
+            let (app, id) = (core.clone(), self.profile_id.clone());
+            self.pending = Some(Promise::thread(core, move || {
+                let paths = rfd::FileDialog::new()
+                    .set_title(t("Додати файли", "Add files"))
+                    .add_filter(t("Документи", "Documents"), &["pdf", "docx", "txt", "md", "markdown"])
+                    .pick_files()?;
+                Some(app.import_docs(&id, &paths))
+            }));
+        }
+    }
+
+    pub fn status(&mut self, ui: &mut egui::Ui, profile_id: &str) {
+        if let Some(report) = self.pending.as_ref().and_then(|p| p.take()) {
+            self.pending = None;
+            self.report = report;
+        }
+        if self.profile_id != profile_id {
+            return;
+        }
+        if self.pending.is_some() {
+            ui.label(muted(t("Імпорт…", "Importing…")));
+        }
+        if let Some(report) = &self.report {
+            if report.added != 0 {
+                ui.label(small(tr!("Додано файлів: {}", "Files added: {}", report.added)));
+            }
+            if !report.failures.is_empty() {
+                banner_text(ui, Tone::Warn, &report.failures.join("\n"));
+            }
+        }
+    }
 }
 
 pub fn show(ui: &mut egui::Ui, c: &mut Ctx, st: &mut ProfileState) {
@@ -60,13 +91,6 @@ pub fn show(ui: &mut egui::Ui, c: &mut Ctx, st: &mut ProfileState) {
     let Some(active) = active else { return };
     if st.draft.as_ref().is_none_or(|d| d.id != active.id) {
         st.draft = Some(active.clone());
-    }
-    if let Some(r) = st.import.as_ref().and_then(|p| p.take()) {
-        st.import = None;
-        st.err = match r {
-            Some(Err(e)) => Some(e),
-            _ => None,
-        };
     }
     let draft = st.draft.as_mut().unwrap();
 
@@ -87,7 +111,6 @@ pub fn show(ui: &mut egui::Ui, c: &mut Ctx, st: &mut ProfileState) {
             let opts: Vec<(String, String)> = profiles.iter().map(|p| (p.id.clone(), p.name.clone())).collect();
             if combo(ui, "profile-select", &mut cur, &opts, 220.0) {
                 core.update_settings(|s| s.active_profile_id = cur);
-                core.session.reload_knowledge();
             }
         });
     });
@@ -145,14 +168,10 @@ pub fn show(ui: &mut egui::Ui, c: &mut Ctx, st: &mut ProfileState) {
         ui.horizontal(|ui| {
             h2(ui, t("Документи профілю", "Profile documents"));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ghost_sm(ui, t("Вставити текст", "Paste text")) {
-                    st.paste = Some((DocKind::Jd, String::new()));
-                }
-                for k in [DocKind::Notes, DocKind::Jd, DocKind::Cv] {
-                    if btn_sm(ui, &tr!("+ {} (файл)", "+ {} (file)", kind_label(k))) && st.import.is_none() {
-                        st.err = None;
-                        st.import = Some(start_import(&core, active.id.clone(), k));
-                    }
+                st.import.button(ui, &core, &active.id);
+                if button(ui, t("Вставити текст", "Paste text"), Kind::Ghost, true, st.paste.is_none()).clicked() {
+                    st.err = None;
+                    st.paste = Some(String::new());
                 }
             });
         });
@@ -163,21 +182,23 @@ pub fn show(ui: &mut egui::Ui, c: &mut Ctx, st: &mut ProfileState) {
                 "PDF, DOCX, TXT, MD. Text is extracted and indexed on this computer. Only fragments relevant to the question go into answers.",
             ),
         );
-        if st.import.is_some() {
-            ui.label(muted(t("Імпорт…", "Importing…")));
-        }
+        st.import.status(ui, &active.id);
         error_text(ui, &st.err);
         let mut close = false;
-        if let Some((kind, text)) = st.paste.as_mut() {
-            let opts: Vec<(DocKind, String)> = DocKind::ALL.iter().map(|k| (*k, kind_label(*k).to_string())).collect();
-            combo(ui, "paste-kind", kind, &opts, 180.0);
-            ui.add(egui::TextEdit::multiline(text).desired_rows(8).desired_width(ui.available_width()).hint_text(t("Вставте текст вакансії або резюме", "Paste the job description or CV text")));
+        if let Some(text) = st.paste.as_mut() {
+            ui.add(egui::TextEdit::multiline(text).desired_rows(8).desired_width(ui.available_width()).hint_text(t("Вставте матеріали для профілю", "Paste materials for your profile")));
             ui.horizontal(|ui| {
                 if primary(ui, t("Додати", "Add"), !text.trim().is_empty()) {
-                    core.add_text(&active.id, *kind, &tr!("{} (вставка)", "{} (pasted)", kind_label(*kind)), text);
-                    close = true;
+                    match core.add_profile_text(&active.id, t("Вставлений текст", "Pasted text"), text) {
+                        Ok(()) => {
+                            st.err = None;
+                            close = true;
+                        }
+                        Err(error) => st.err = Some(error),
+                    }
                 }
                 if ghost_sm(ui, t("Скасувати", "Cancel")) {
+                    st.err = None;
                     close = true;
                 }
             });
@@ -187,11 +208,10 @@ pub fn show(ui: &mut egui::Ui, c: &mut Ctx, st: &mut ProfileState) {
         }
         let docs = core.db.list_docs(&active.id);
         if docs.is_empty() {
-            banner_text(ui, Tone::Info, t("Документів немає. Без резюме відповіді будуть загальними — особистий досвід не вигадуватиметься.", "No documents. Without a CV answers stay general — personal experience is never invented."));
+            ui.label(muted(t("Документів ще немає.", "No documents yet.")));
         }
         for d in docs {
             ui.horizontal(|ui| {
-                chip(ui, kind_label(d.kind), false);
                 ui.label(small(&d.name));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if danger_sm(ui, t("Видалити", "Delete")) {
